@@ -1,0 +1,60 @@
+[project]
+name = "lance-assistant"
+version = "0.1.0"
+description = "Chat-style multimodal assistant powered by ByteDance Lance (T2I/T2V/edit/understand) with an optional OpenAI-compatible orchestrator front-end."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Nathan W. (SanDiegoDude)" },
+]
+keywords = ["lance", "bytedance", "multimodal", "text-to-image", "text-to-video", "vlm"]
+dependencies = [
+    # core ML
+    "torch>=2.5",
+    "safetensors>=0.4",
+    "transformers>=4.49",
+    "huggingface_hub>=0.26",
+    "accelerate>=0.30",
+    # webui
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "aiofiles>=23",
+    # media + utils
+    "pillow",
+    "numpy",
+    "einops",
+    "imageio",
+    "imageio-ffmpeg",
+    "tqdm",
+    "av",
+]
+
+[project.optional-dependencies]
+# Not pinned by default because they're CUDA-version-specific. Install
+# manually matching your CUDA: e.g.
+#   pip install flash-attn==2.6.3 --no-build-isolation
+# or for sm_89/sm_90:
+#   pip install flash-attn>=2.7.0 --no-build-isolation
+gpu = [
+    "flash-attn>=2.6",
+]
+
+[project.urls]
+Homepage    = "https://github.com/SanDiegoDude/lance-assistant"
+Repository  = "https://github.com/SanDiegoDude/lance-assistant"
+Issues      = "https://github.com/SanDiegoDude/lance-assistant/issues"
+"Upstream Lance" = "https://github.com/bytedance/Lance"
+
+[project.scripts]
+lance = "lance.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

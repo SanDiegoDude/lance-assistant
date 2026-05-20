@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lance Assistant</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- marked.js for rendering assistant markdown (code fences, lists, etc.) -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@13.0.3/marked.min.js"></script>
+  <!-- DOMPurify so we can trust ourselves to render arbitrary markdown -->
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+  <!-- highlight.js for syntax-highlighted code fences -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github-dark.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/core.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/python.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/javascript.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/typescript.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/bash.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/json.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/yaml.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/rust.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/lib/languages/go.min.js"></script>
+  <style>
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.22); }
+    @keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .fade-up { animation: fadeUp 220ms ease-out both; }
+    @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .pulse-dot { animation: pulse-dot 1.2s ease-in-out infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+    .blink { animation: blink 1s steps(2, start) infinite; }
+
+    /* Markdown bubble styles */
+    .prose-chat p { margin: 0.35rem 0; }
+    .prose-chat p:first-child { margin-top: 0; }
+    .prose-chat p:last-child  { margin-bottom: 0; }
+    .prose-chat ul, .prose-chat ol { margin: 0.4rem 0; padding-left: 1.25rem; }
+    .prose-chat li { margin: 0.15rem 0; }
+    .prose-chat code { background: #1f2026; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85em; }
+    .prose-chat pre { margin: 0.6rem 0; }
+    .prose-chat pre code {
+      display: block; padding: 0.85rem 1rem; background: #0d0e12; border: 1px solid #26262e;
+      border-radius: 10px; font-size: 0.82rem; line-height: 1.45; overflow-x: auto;
+    }
+    .prose-chat h1, .prose-chat h2, .prose-chat h3 { font-weight: 600; margin: 0.6rem 0 0.3rem; }
+    .prose-chat h1 { font-size: 1.05rem; }
+    .prose-chat h2 { font-size: 1.0rem; }
+    .prose-chat h3 { font-size: 0.95rem; }
+    .prose-chat blockquote { border-left: 3px solid #3f3f47; padding-left: 0.7rem; color: #c4c4cc; margin: 0.4rem 0; }
+    .prose-chat a { color: #a78bfa; text-decoration: underline; text-underline-offset: 2px; }
+    .prose-chat table { border-collapse: collapse; margin: 0.5rem 0; }
+    .prose-chat th, .prose-chat td { border: 1px solid #2a2a32; padding: 0.3rem 0.55rem; font-size: 0.85rem; }
+  </style>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            bg: { 0: "#0a0a0c", 1: "#111114", 2: "#16161a", 3: "#1c1c22" },
+            line: "#26262e",
+            txt: { 0: "#f5f5f7", 1: "#c4c4cc", 2: "#888892" },
+            brand:  "#a78bfa",
+            brand2: "#7c3aed",
+            ok:     "#34d399",
+            warn:   "#fbbf24",
+            err:    "#f87171",
+            info:   "#60a5fa",
+          },
+        },
+      },
+    };
+  </script>
+</head>
+<body class="bg-bg-0 text-txt-0 h-full overflow-hidden font-sans">
+  <div id="root" class="h-full"></div>
+  <script type="module">
+    import { h, render } from "https://esm.sh/preact@10.22.0";
+    import { useState, useEffect, useRef, useCallback, useMemo } from "https://esm.sh/preact@10.22.0/hooks";
+    import htm from "https://esm.sh/htm@3.1.1";
+    const html = htm.bind(h);
+
+    // -------------------- Markdown --------------------
+    // Configure marked + highlight.js
+    if (window.marked && window.hljs) {
+      // Defer highlight to a manual pass per code block.
+      window.marked.setOptions({ gfm: true, breaks: false });
+    }
+
+    function renderMarkdown(text) {
+      if (!window.marked) return text;
+      const raw = window.marked.parse(text || "");
+      const clean = window.DOMPurify ? window.DOMPurify.sanitize(raw) : raw;
+      return clean;
+    }
+
+    function MarkdownBubble({ text, className }) {
+      const ref = useRef(null);
+      useEffect(() => {
+        if (!ref.current) return;
+        const blocks = ref.current.querySelectorAll("pre code");
+        blocks.forEach(b => {
+          try { if (window.hljs && !b.dataset.hl) { window.hljs.highlightElement(b); b.dataset.hl = "1"; } } catch (_) {}
+        });
+      }, [text]);
+      return html`<div ref=${ref}
+        class=${"prose-chat text-sm leading-relaxed text-txt-0 " + (className || "")}
+        dangerouslySetInnerHTML=${{ __html: renderMarkdown(text) }} />`;
+    }
+
+    // -------------------- Helpers --------------------
+
+    function classNames(...xs) { return xs.filter(Boolean).join(" "); }
+
+    function formatElapsed(s) {
+      if (s == null) return "";
+      if (s < 60) return `${s.toFixed(1)}s`;
+      const m = Math.floor(s / 60);
+      const r = (s % 60).toFixed(0);
+      return `${m}m ${r}s`;
+    }
+
+    const TOOL_LABEL = {
+      generate_image: "Generating image…",
+      generate_video: "Generating video…",
+      edit_image:     "Editing image…",
+      edit_video:     "Editing video…",
+      // native fallback task names
+      t2i:        "Generating image…",
+      t2v:        "Generating video…",
+      image_edit: "Editing image…",
+      video_edit: "Editing video…",
+      x2t_image:  "Reading image…",
+      x2t_video:  "Watching video…",
+    };
+    const TOOL_HINT = {
+      generate_image: "~2 min on a single H100/GB10 at 768²",
+      generate_video: "Video gen is slow — 192p ≈ 3 min, 360p ≈ 8 min, 480p ≈ 26 min",
+      edit_image:     "~1 min — identity preserved through the edit",
+      edit_video:     "Video edit is slow (similar timing to T2V)",
+      t2i: "~2 min at 768²",
+      t2v: "Slow: 192p≈3min, 480p≈26min",
+      image_edit: "~1 min",
+      video_edit: "Slow",
+    };
+
+    function MediaBlock({ kind, url, filename, onUseAsInput }) {
+      const isImg = kind === "image";
+      return html`
+        <div class="space-y-1.5">
+          ${isImg
+            ? html`<img src=${url} class="max-w-full rounded-xl border border-line shadow-lg max-h-[60vh]" alt="generated"/>`
+            : html`<video src=${url} controls loop class="max-w-full rounded-xl border border-line shadow-lg max-h-[60vh]"/>`}
+          <div class="flex items-center gap-2 text-[11px] text-txt-2">
+            ${onUseAsInput ? html`
+              <button onClick=${onUseAsInput}
+                class="px-2 py-1 rounded-md border border-line bg-bg-2 hover:bg-bg-3 text-txt-1">
+                ↻ Use as input for next message
+              </button>` : null}
+            <a href=${url} download=${filename || ""}
+              class="px-2 py-1 rounded-md border border-line bg-bg-2 hover:bg-bg-3 text-txt-1">
+              ⬇ Download
+            </a>
+            ${filename ? html`<span class="font-mono">${filename}</span>` : null}
+          </div>
+        </div>`;
+    }
+
+    function ToolBubble({ b, onUseAsInput }) {
+      const label = TOOL_LABEL[b.name] || b.name;
+      const hint  = TOOL_HINT[b.name];
+      const inner = b.kind_inner || (b.media_url ? (b.media_url.endsWith(".mp4") ? "video" : "image") : null);
+      const status = b.status || (b.media_url ? "done" : "running");
+
+      const statusColor =
+        status === "done"     ? "border-brand/30 bg-brand/5"
+      : status === "error"    ? "border-err/40 bg-err/5"
+      :                         "border-info/40 bg-info/5";
+
+      return html`
+        <div class=${"rounded-xl border " + statusColor + " p-2.5 space-y-1.5"}>
+          <div class="flex items-center gap-2 text-[11px] uppercase tracking-wider text-txt-2">
+            <span class=${
+              "inline-block w-1.5 h-1.5 rounded-full " +
+              (status === "done"  ? "bg-brand"
+              : status === "error" ? "bg-err" : "bg-info pulse-dot")
+            }></span>
+            <span>${label}</span>
+            ${b.elapsed != null && status === "done" ? html`<span>· ${formatElapsed(b.elapsed)}</span>` : null}
+            ${b.elapsed != null && status !== "done" && status !== "error"
+              ? html`<span>· ${formatElapsed(b.elapsed)}</span>` : null}
+            ${hint && status !== "done" ? html`<span class="text-txt-2 hidden md:inline">· ${hint}</span>` : null}
+          </div>
+          ${b.args && (b.args.prompt || b.args.instruction) ? html`
+            <div class="text-xs text-txt-1 italic">"${b.args.prompt || b.args.instruction}"</div>` : null}
+          ${b.error ? html`
+            <div class="text-xs text-err whitespace-pre-wrap break-words">${b.error}</div>` : null}
+          ${b.media_url ? html`
+            <${MediaBlock} kind=${inner} url=${b.media_url} filename=${b.media_filename}
+              onUseAsInput=${onUseAsInput ? () => onUseAsInput(b) : null} />` : null}
+        </div>`;
+    }
+
+    // -------------------- Hook: useChat --------------------
+
+    function useChat() {
+      const [convId, setConvId] = useState(null);
+      const [messages, setMessages] = useState([]);
+      const [pendingAttachment, setPendingAttachment] = useState(null); // {file, name, kind, previewUrl}
+      const [busy, setBusy] = useState(false);
+      const [health, setHealth] = useState(null);
+
+      const pushMessage = useCallback((m) => {
+        setMessages(prev => [...prev, { ...m, ts: Date.now() }]);
+      }, []);
+
+      const updateMessage = useCallback((id, patchFn) => {
+        setMessages(prev => prev.map(m => m.id === id ? patchFn(m) : m));
+      }, []);
+
+      // Health/orchestrator probe
+      useEffect(() => {
+        let cancelled = false;
+        async function tick() {
+          try {
+            const r = await fetch("/api/health");
+            const j = await r.json();
+            if (!cancelled) setHealth(j);
+          } catch (_) {}
+        }
+        tick();
+        const id = setInterval(tick, 8000);
+        return () => { cancelled = true; clearInterval(id); };
+      }, []);
+
+      // Create a conversation lazily
+      const ensureConv = useCallback(async () => {
+        if (convId) return convId;
+        const r = await fetch("/api/conversations", { method: "POST" });
+        const j = await r.json();
+        setConvId(j.conversation_id);
+        return j.conversation_id;
+      }, [convId]);
+
+      const reprobeOrchestrator = useCallback(async () => {
+        try {
+          const r = await fetch("/api/orchestrator/probe", { method: "POST" });
+          const j = await r.json();
+          setHealth(prev => prev ? { ...prev, orchestrator: { ...(prev.orchestrator || {}), ...j } } : prev);
+        } catch (_) {}
+      }, []);
+
+      const submit = useCallback(async ({ prompt, mode, useOrchestrator }) => {
+        if (busy) return;
+        if (!prompt && !pendingAttachment) return;
+        setBusy(true);
+
+        const cid = await ensureConv();
+
+        const userMsg = {
+          id: `u-${Date.now()}`,
+          role: "user",
+          text: prompt,
+          attachment: pendingAttachment
+            ? { kind: pendingAttachment.kind, previewUrl: pendingAttachment.previewUrl, name: pendingAttachment.name }
+            : null,
+        };
+        pushMessage(userMsg);
+
+        const aId = `a-${Date.now() + 1}`;
+        const aMsg = {
+          id: aId,
+          role: "assistant",
+          blocks: [],          // mix of {kind:"text", text} and {kind:"tool", ...}
+          status: "running",
+          startedAt: Date.now(),
+        };
+        pushMessage(aMsg);
+
+        const form = new FormData();
+        form.append("prompt", prompt || "");
+        form.append("mode", mode);
+        form.append("use_orchestrator", String(!!useOrchestrator));
+        if (pendingAttachment?.file) {
+          form.append("attachment", pendingAttachment.file, pendingAttachment.name);
+        }
+        setPendingAttachment(null);
+
+        // POST + stream NDJSON-over-SSE
+        const ctrl = new AbortController();
+        let res;
+        try {
+          res = await fetch(`/api/conversations/${cid}/messages`, {
+            method: "POST",
+            body: form,
+            signal: ctrl.signal,
+          });
+        } catch (e) {
+          updateMessage(aId, m => ({ ...m, status: "error",
+            blocks: [...m.blocks, { kind: "text", text: `_Network error: ${e.message}_` }] }));
+          setBusy(false);
+          return;
+        }
+        if (!res.ok || !res.body) {
+          const text = await (res.text?.() ?? Promise.resolve(""));
+          updateMessage(aId, m => ({ ...m, status: "error",
+            blocks: [...m.blocks, { kind: "text", text: `_Server returned ${res.status}: ${text}_` }] }));
+          setBusy(false);
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let currentTextIdx = -1;       // index of the current text block we're appending to
+
+        function appendBlock(blk) {
+          updateMessage(aId, m => ({ ...m, blocks: [...m.blocks, blk] }));
+        }
+        function appendTextDelta(delta) {
+          updateMessage(aId, m => {
+            const blocks = m.blocks.slice();
+            const last = blocks[blocks.length - 1];
+            if (last && last.kind === "text" && last._streaming) {
+              blocks[blocks.length - 1] = { ...last, text: last.text + delta };
+            } else {
+              blocks.push({ kind: "text", text: delta, _streaming: true });
+              currentTextIdx = blocks.length - 1;
+            }
+            return { ...m, blocks };
+          });
+        }
+        function sealStreamingText() {
+          updateMessage(aId, m => {
+            const blocks = m.blocks.map(b => b._streaming ? ({ ...b, _streaming: false }) : b);
+            return { ...m, blocks };
+          });
+        }
+        function updateOrAppendToolBlock(evt) {
+          // Match by tool id
+          updateMessage(aId, m => {
+            const blocks = m.blocks.slice();
+            const idx = blocks.findIndex(b => b.kind === "tool" && b.tool_id === evt.id);
+            const elapsed = evt.elapsed ?? (Date.now() - aMsg.startedAt) / 1000;
+            const base = idx >= 0 ? { ...blocks[idx] } : { kind: "tool", tool_id: evt.id };
+            if (evt.type === "tool_start") {
+              base.name = evt.name;
+              base.args = evt.args;
+              base.status = "running";
+              base.startedAt = Date.now();
+              base.elapsed = 0;
+            } else if (evt.type === "tool_result") {
+              base.status = "done";
+              base.elapsed = elapsed;
+              const r = evt.result || {};
+              if (r.media_url) {
+                base.media_url = r.media_url;
+                base.media_filename = r.media_filename;
+                base.kind_inner = r.kind;
+              } else if (r.kind === "text") {
+                // Native fallback returned text — add it as a separate text block
+                blocks.push({ kind: "text", text: r.text || "" });
+              }
+            } else if (evt.type === "tool_error") {
+              base.status = "error";
+              base.error = evt.error;
+              base.elapsed = elapsed;
+            }
+            if (idx >= 0) blocks[idx] = base; else blocks.push(base);
+            return { ...m, blocks };
+          });
+        }
+
+        // tick elapsed on running tools
+        const elapsedInterval = setInterval(() => {
+          updateMessage(aId, m => {
+            const now = Date.now();
+            const blocks = m.blocks.map(b => {
+              if (b.kind === "tool" && b.status === "running" && b.startedAt) {
+                return { ...b, elapsed: (now - b.startedAt) / 1000 };
+              }
+              return b;
+            });
+            return { ...m, blocks };
+          });
+        }, 250);
+
+        try {
+          // eslint-disable-next-line no-constant-condition
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const events = buffer.split("\n\n");
+            buffer = events.pop() || "";
+            for (const ev of events) {
+              const line = ev.trim();
+              if (!line.startsWith("data:")) continue;
+              let data;
+              try { data = JSON.parse(line.slice(5).trim()); } catch (_) { continue; }
+
+              if (data.type === "start") {
+                updateMessage(aId, m => ({ ...m, task_kind: data.task }));
+              } else if (data.type === "text_delta") {
+                appendTextDelta(data.delta);
+              } else if (data.type === "tool_start" || data.type === "tool_result" || data.type === "tool_error") {
+                sealStreamingText();
+                updateOrAppendToolBlock(data);
+              } else if (data.type === "error") {
+                appendBlock({ kind: "text", text: `_Error: ${data.message}_` });
+                updateMessage(aId, m => ({ ...m, status: "error" }));
+              } else if (data.type === "done") {
+                sealStreamingText();
+                updateMessage(aId, m => ({ ...m, status: m.status === "error" ? "error" : "done" }));
+              }
+            }
+          }
+        } finally {
+          clearInterval(elapsedInterval);
+          setBusy(false);
+        }
+      }, [busy, pendingAttachment, pushMessage, updateMessage, ensureConv]);
+
+      const setAttachmentFromFile = useCallback((file) => {
+        if (!file) { setPendingAttachment(null); return; }
+        const kind = file.type.startsWith("image/") ? "image"
+                    : file.type.startsWith("video/") ? "video"
+                    : (/\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name) ? "image"
+                        : (/\.(mp4|mov|webm|avi|mkv)$/i.test(file.name) ? "video" : null));
+        if (!kind) { alert("Please attach an image or video."); return; }
+        const previewUrl = URL.createObjectURL(file);
+        setPendingAttachment({ file, name: file.name, kind, previewUrl });
+      }, []);
+
+      const reattachFromUrl = useCallback(async (mediaUrl, filename, kind) => {
+        // Just fetch the bytes and stash them as a pending attachment so the
+        // next submission re-uploads them.
+        try {
+          const r = await fetch(mediaUrl);
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const blob = await r.blob();
+          const file = new File([blob], filename || "media", { type: blob.type });
+          setAttachmentFromFile(file);
+        } catch (e) {
+          alert(`Re-attach failed: ${e.message}`);
+        }
+      }, [setAttachmentFromFile]);
+
+      const newChat = useCallback(() => {
+        setMessages([]);
+        setConvId(null);
+        setPendingAttachment(null);
+      }, []);
+
+      return {
+        convId, messages, busy, health,
+        pendingAttachment, setAttachmentFromFile, setPendingAttachment,
+        reattachFromUrl, submit, newChat, reprobeOrchestrator,
+      };
+    }
+
+    // -------------------- Components --------------------
+
+    function HealthPill({ info, onReprobe }) {
+      const orchOk = info?.orchestrator?.reachable;
+      const modelLoaded = info?.ready;
+      const orchTxt = !info
+        ? "checking…"
+        : orchOk
+          ? `orchestrator: ${info.orchestrator.model || "model"} ✓`
+          : "orchestrator: offline — native mode";
+      const lanceTxt = modelLoaded
+        ? "Lance: loaded"
+        : (info?.queue_depth ? `Lance: loading (${info.queue_depth} queued)` : "Lance: cold (loads on 1st request)");
+      return html`
+        <div class="flex items-center gap-2">
+          <button onClick=${onReprobe}
+            class=${"px-2.5 py-1 rounded-full text-[11px] " + (orchOk ? "bg-ok/15 text-ok" : "bg-warn/15 text-warn") + " hover:bg-bg-3 cursor-pointer"}
+            title="Click to re-probe the orchestrator">
+            <span class=${"inline-block w-1.5 h-1.5 rounded-full mr-1.5 align-middle " + (orchOk ? "bg-ok" : "bg-warn pulse-dot")}></span>
+            ${orchTxt}
+          </button>
+          <div class=${"px-2.5 py-1 rounded-full text-[11px] " + (modelLoaded ? "bg-ok/15 text-ok" : "bg-bg-3 text-txt-2")}>
+            <span class=${"inline-block w-1.5 h-1.5 rounded-full mr-1.5 align-middle " + (modelLoaded ? "bg-ok" : "bg-txt-2")}></span>
+            ${lanceTxt}
+          </div>
+        </div>`;
+    }
+
+    function ModePill({ value, current, onClick, label, sub }) {
+      const active = value === current;
+      return html`
+        <button onClick=${onClick}
+          class=${"px-3 py-1.5 rounded-full border text-xs transition-colors " +
+            (active ? "bg-brand/20 border-brand text-txt-0" : "bg-bg-2 border-line text-txt-1 hover:bg-bg-3")}
+          title=${sub}>${label}</button>`;
+    }
+
+    function UserMessage({ m }) {
+      return html`
+        <div class="flex justify-end fade-up">
+          <div class="max-w-[80%] space-y-2">
+            ${m.attachment ? html`
+              <div class="ml-auto w-fit">
+                ${m.attachment.kind === "image"
+                  ? html`<img src=${m.attachment.previewUrl} class="max-h-48 rounded-lg border border-line"/>`
+                  : html`<video src=${m.attachment.previewUrl} class="max-h-48 rounded-lg border border-line"/>`}
+                <div class="text-[10px] text-txt-2 mt-1 text-right">${m.attachment.name}</div>
+              </div>` : null}
+            ${m.text ? html`
+              <div class="bg-brand/10 border border-brand/30 rounded-2xl rounded-br-md px-4 py-2.5 text-sm whitespace-pre-wrap leading-relaxed">
+                ${m.text}
+              </div>` : null}
+          </div>
+        </div>`;
+    }
+
+    function AssistantMessage({ m, onUseAsInput }) {
+      const status = m.status || "running";
+      const statusColor = status === "done"  ? "text-ok"
+                       : status === "error" ? "text-err"
+                       :                       "text-brand";
+      const hasContent = m.blocks && m.blocks.length > 0;
+      return html`
+        <div class="flex justify-start fade-up">
+          <div class="max-w-[85%] space-y-2 w-full">
+            <div class="text-[10px] uppercase tracking-wider ${statusColor} flex items-center gap-2">
+              <span class=${"inline-block w-1.5 h-1.5 rounded-full " +
+                  (status === "running" ? "bg-brand pulse-dot"
+                : status === "error"    ? "bg-err"
+                :                          "bg-ok")}></span>
+              <span>${m.task_kind === "lance_native" ? "Lance (no orchestrator)" : "Assistant"}</span>
+            </div>
+
+            ${hasContent ? m.blocks.map((b, i) => {
+              if (b.kind === "text") {
+                return html`<div key=${i} class="bg-bg-2 border border-line rounded-2xl rounded-bl-md px-4 py-2.5 text-sm">
+                  <${MarkdownBubble} text=${b.text} />
+                  ${b._streaming ? html`<span class="blink text-txt-2">▍</span>` : null}
+                </div>`;
+              }
+              if (b.kind === "tool") {
+                return html`<${ToolBubble} key=${i} b=${b} onUseAsInput=${onUseAsInput} />`;
+              }
+              return null;
+            }) : html`
+              <div class="bg-bg-2 border border-line rounded-2xl rounded-bl-md px-4 py-2.5 text-sm text-txt-2 flex items-center gap-2">
+                <span class="inline-block w-2 h-2 rounded-full bg-brand pulse-dot"></span>
+                <span>thinking…</span>
+              </div>`}
+          </div>
+        </div>`;
+    }
+
+    function Composer({ chat }) {
+      const fileInputRef = useRef(null);
+      const taRef = useRef(null);
+      const [prompt, setPrompt] = useState("");
+      const [mode, setMode] = useState("auto");
+      const [useOrchestrator, setUseOrchestrator] = useState(true);
+      const [dragOver, setDragOver] = useState(false);
+
+      useEffect(() => {
+        const onPaste = (e) => {
+          for (const item of e.clipboardData?.items || []) {
+            if (item.kind === "file") {
+              chat.setAttachmentFromFile(item.getAsFile());
+              break;
+            }
+          }
+        };
+        window.addEventListener("paste", onPaste);
+        return () => window.removeEventListener("paste", onPaste);
+      }, [chat]);
+
+      const onSend = useCallback(() => {
+        const p = prompt.trim();
+        if (!p && !chat.pendingAttachment) return;
+        chat.submit({ prompt: p, mode, useOrchestrator });
+        setPrompt("");
+        if (taRef.current) taRef.current.style.height = "auto";
+      }, [prompt, mode, useOrchestrator, chat]);
+
+      const onKeyDown = useCallback((e) => {
+        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSend(); }
+      }, [onSend]);
+
+      const onDrop = (e) => {
+        e.preventDefault(); setDragOver(false);
+        const file = e.dataTransfer?.files?.[0];
+        if (file) chat.setAttachmentFromFile(file);
+      };
+
+      useEffect(() => {
+        if (taRef.current) {
+          taRef.current.style.height = "auto";
+          taRef.current.style.height = `${Math.min(taRef.current.scrollHeight, 260)}px`;
+        }
+      }, [prompt]);
+
+      const orchReachable = chat.health?.orchestrator?.reachable;
+
+      return html`
+        <div class="border-t border-line bg-bg-1/95 backdrop-blur-md">
+          <div class="max-w-3xl mx-auto px-4 py-3 space-y-2">
+
+            ${chat.pendingAttachment ? html`
+              <div class="flex items-center gap-2 bg-bg-2 border border-line rounded-lg p-2">
+                ${chat.pendingAttachment.kind === "image"
+                  ? html`<img src=${chat.pendingAttachment.previewUrl} class="h-12 w-12 object-cover rounded"/>`
+                  : html`<video src=${chat.pendingAttachment.previewUrl} class="h-12 w-12 object-cover rounded"/>`}
+                <div class="text-xs text-txt-1 flex-1 truncate">
+                  <div class="font-mono truncate">${chat.pendingAttachment.name}</div>
+                  <div class="text-txt-2">attached · ${chat.pendingAttachment.kind}</div>
+                </div>
+                <button onClick=${() => chat.setPendingAttachment(null)}
+                  class="text-txt-2 hover:text-txt-0 px-2">✕</button>
+              </div>` : null}
+
+            <div class="flex items-center flex-wrap gap-1.5">
+              <span class="text-[11px] text-txt-2 mr-1">Hint:</span>
+              <${ModePill} value="auto" current=${mode} onClick=${() => setMode("auto")} label="Auto" sub="Let the orchestrator decide" />
+              <${ModePill} value="text" current=${mode} onClick=${() => setMode("text")} label="Text" sub="Text-only response" />
+              <${ModePill} value="image" current=${mode} onClick=${() => setMode("image")} label="Image" sub="Want an image as output" />
+              <${ModePill} value="video" current=${mode} onClick=${() => setMode("video")} label="Video" sub="Want a video as output (slow)" />
+              <${ModePill} value="understand" current=${mode} onClick=${() => setMode("understand")} label="Understand" sub="Describe / analyze attached media" />
+
+              <div class="flex-1"></div>
+              ${orchReachable ? html`
+                <label class="flex items-center gap-1 text-[11px] text-txt-2 cursor-pointer">
+                  <input type="checkbox" checked=${useOrchestrator}
+                    onChange=${e => setUseOrchestrator(e.target.checked)}
+                    class="accent-brand"/>
+                  Orchestrator
+                </label>` : null}
+            </div>
+
+            <div class=${classNames(
+              "flex items-end gap-2 bg-bg-2 border rounded-2xl p-2",
+              dragOver ? "border-brand ring-2 ring-brand/30" : "border-line"
+            )}
+              onDragOver=${e => { e.preventDefault(); setDragOver(true); }}
+              onDragLeave=${() => setDragOver(false)}
+              onDrop=${onDrop}>
+
+              <button onClick=${() => fileInputRef.current?.click()}
+                class="p-2 text-txt-2 hover:text-txt-0" title="Attach image or video (or drag here, or paste)">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                </svg>
+              </button>
+              <input ref=${fileInputRef} type="file" class="hidden"
+                accept="image/*,video/*"
+                onChange=${e => { chat.setAttachmentFromFile(e.target.files?.[0]); e.target.value = ""; }} />
+
+              <textarea ref=${taRef} value=${prompt}
+                onInput=${e => setPrompt(e.target.value)}
+                onKeyDown=${onKeyDown}
+                placeholder=${chat.pendingAttachment
+                  ? "Describe what to do with the attached media… (Shift+Enter for newline)"
+                  : "Ask, generate, or describe… (Shift+Enter for newline)"}
+                rows="1"
+                class="flex-1 bg-transparent text-sm text-txt-0 placeholder-txt-2 outline-none resize-none px-2 py-2 leading-relaxed" />
+
+              <button onClick=${onSend}
+                disabled=${chat.busy || (!prompt.trim() && !chat.pendingAttachment)}
+                class=${classNames(
+                  "p-2 rounded-xl transition-colors",
+                  chat.busy || (!prompt.trim() && !chat.pendingAttachment)
+                    ? "bg-bg-3 text-txt-2 cursor-not-allowed"
+                    : "bg-brand text-bg-0 hover:bg-brand2 hover:text-txt-0"
+                )}>
+                ${chat.busy ? html`
+                  <svg class="animate-spin" width="18" height="18" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" stroke-opacity="0.3"/>
+                    <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                  </svg>`
+                  : html`
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="22" y1="2" x2="11" y2="13"/>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                  </svg>`}
+              </button>
+            </div>
+
+            <div class="text-[10px] text-txt-2 px-2">
+              Enter to send · Shift+Enter for newline · drag-and-drop or paste files
+              ${!orchReachable && chat.health ? html`<span class="ml-2 text-warn">· orchestrator offline → using Lance-native dispatch</span>` : null}
+            </div>
+          </div>
+        </div>`;
+    }
+
+    function EmptyState({ orchOk, onPick }) {
+      const ideas = orchOk
+        ? [
+            { icon: "🖼", label: "Draw a cinematic shot of a desert at golden hour, ultrawide", mode: "auto" },
+            { icon: "🎬", label: "Generate a 3-second video of a pastel hot-air balloon over snowy peaks", mode: "auto" },
+            { icon: "💬", label: "What can you do?", mode: "auto" },
+            { icon: "🔎", label: "Attach an image and ask 'what is this?'", mode: "auto" },
+          ]
+        : [
+            { icon: "🖼", label: "Draw a cinematic shot of a desert at golden hour", mode: "image" },
+            { icon: "🎬", label: "A pastel hot-air balloon drifting over snowy peaks", mode: "video" },
+            { icon: "🔎", label: "Describe what you see (attach an image first)", mode: "understand" },
+            { icon: "✏️", label: "Make it night-time with neon lights (attach an image)", mode: "image" },
+          ];
+      return html`
+        <div class="h-full flex flex-col items-center justify-center text-center px-6">
+          <div class="w-14 h-14 rounded-2xl bg-brand/10 border border-brand/30 flex items-center justify-center mb-4">
+            <span class="text-2xl">🪶</span>
+          </div>
+          <h1 class="text-2xl font-semibold text-txt-0 mb-1">Lance Assistant</h1>
+          <p class="text-sm text-txt-2 mb-2 max-w-md">
+            A unified multimodal model — generate images and video, edit either,
+            and reason about media you attach.
+          </p>
+          <p class="text-[11px] text-txt-2 mb-8 max-w-md">
+            ${orchOk
+              ? "Driven by your local orchestrator VLM. It chats with you and calls Lance whenever you need new pixels."
+              : "Orchestrator offline — falling back to Lance-native dispatch. Pick a mode pill to choose the task explicitly."}
+          </p>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-2 w-full max-w-2xl">
+            ${ideas.map(i => html`
+              <button onClick=${() => onPick(i)}
+                class="text-left px-4 py-3 rounded-xl border border-line bg-bg-2 hover:bg-bg-3 transition-colors">
+                <span class="mr-2">${i.icon}</span>
+                <span class="text-sm text-txt-1">${i.label}</span>
+              </button>`)}
+          </div>
+        </div>`;
+    }
+
+    function App() {
+      const chat = useChat();
+      const scrollRef = useRef(null);
+
+      useEffect(() => {
+        if (!scrollRef.current) return;
+        scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+      }, [chat.messages.length, chat.messages[chat.messages.length-1]?.blocks?.length]);
+
+      const onUseAsInput = useCallback((toolBlock) => {
+        if (!toolBlock.media_url) return;
+        chat.reattachFromUrl(toolBlock.media_url, toolBlock.media_filename, toolBlock.kind_inner);
+      }, [chat]);
+
+      const orchOk = chat.health?.orchestrator?.reachable;
+
+      return html`
+        <div class="h-full flex flex-col">
+          <!-- Header -->
+          <div class="border-b border-line bg-bg-1/95 backdrop-blur">
+            <div class="max-w-3xl mx-auto px-4 py-2.5 flex items-center gap-3">
+              <div class="w-7 h-7 rounded-lg bg-brand/20 border border-brand/30 flex items-center justify-center">
+                <span class="text-sm">🪶</span>
+              </div>
+              <div class="flex-1 min-w-0">
+                <div class="text-sm font-medium text-txt-0">Lance Assistant</div>
+                <div class="text-[11px] text-txt-2 truncate">
+                  ${orchOk
+                    ? html`<span>via <span class="font-mono">${chat.health.orchestrator.model}</span> @ ${chat.health.orchestrator.base_url}</span>`
+                    : html`<span>ByteDance Lance · 3B unified multimodal</span>`}
+                </div>
+              </div>
+              <button onClick=${chat.newChat}
+                class="text-[11px] text-txt-2 hover:text-txt-0 px-2 py-1 border border-line rounded-md hover:bg-bg-3">
+                New chat
+              </button>
+              <${HealthPill} info=${chat.health} onReprobe=${chat.reprobeOrchestrator} />
+            </div>
+          </div>
+
+          <!-- Messages -->
+          <div ref=${scrollRef} class="flex-1 overflow-y-auto">
+            <div class="max-w-3xl mx-auto px-4 py-6 space-y-4 min-h-full">
+              ${chat.messages.length === 0
+                ? html`<${EmptyState} orchOk=${orchOk} onPick=${(idea) => {
+                    chat.submit({ prompt: idea.label, mode: idea.mode, useOrchestrator: orchOk });
+                  }} />`
+                : chat.messages.map(m =>
+                    m.role === "user"
+                      ? html`<${UserMessage} key=${m.id} m=${m} />`
+                      : html`<${AssistantMessage} key=${m.id} m=${m} onUseAsInput=${onUseAsInput} />`
+                  )}
+            </div>
+          </div>
+
+          <${Composer} chat=${chat} />
+        </div>`;
+    }
+
+    render(html`<${App} />`, document.getElementById("root"));
+  </script>
+</body>
+</html>
