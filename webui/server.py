@@ -350,6 +350,13 @@ class LancePipeline:
         llm_config.tie_word_embeddings = model_args.tie_word_embeddings
         llm_config.freeze_und = inference_args.freeze_und
         llm_config.apply_qwen_2_5_vl_pos_emb = inference_args.apply_qwen_2_5_vl_pos_emb
+        # Newer transformers releases dropped pad_token_id from the base
+        # PretrainedConfig (it moved to GenerationConfig), but Lance's
+        # qwen2_navit.Qwen2Model.__init__ still reads `config.pad_token_id`
+        # directly. Backfill it from bos_token_id (Qwen2 uses <|endoftext|>
+        # which is 151643 for both pad and bos).
+        if getattr(llm_config, "pad_token_id", None) is None:
+            llm_config.pad_token_id = getattr(llm_config, "bos_token_id", 151643)
 
         log("  init LLM (Qwen2ForCausalLM)")
         language_model = Qwen2ForCausalLM(llm_config)
