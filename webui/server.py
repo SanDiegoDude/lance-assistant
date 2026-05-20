@@ -5,19 +5,35 @@ multimodal tasks) plus our extracted HF understanding checkpoint (for pure
 text chat), and dispatches user requests to the right task with a single
 chat-style API.
 
+Architecture:
+
+  - Lance jobs run on a single FIFO worker thread (see webui.jobs.JobRunner).
+    The orchestrator-driven path submits a job and gets `{job_id, status:
+    queued}` back instantly; the worker runs the job and pushes
+    job_started / job_completed events into the conversation's EventBus.
+  - Each conversation has a persistent SSE event channel; the frontend
+    keeps an EventSource open for its lifetime. New events fan out to all
+    subscribers; reconnects replay from a cursor so nothing is missed.
+  - POST /messages is non-blocking: it kicks off an orchestrator-turn task
+    and returns 202; all output flows through the persistent SSE.
+
 Endpoints:
 
-  GET  /                            -> serves webui/static/index.html
-  GET  /static/<path>               -> static files
-  GET  /api/health                  -> {"ready": bool, "models": {...}}
-  POST /api/jobs                    -> multipart form: prompt, mode,
-                                       attachment (optional). Returns
-                                       {"job_id": "..."}
-  GET  /api/jobs/{job_id}           -> {"status": ..., "result": ..., ...}
-  GET  /api/jobs/{job_id}/events    -> SSE stream of progress events
-  GET  /api/media/{job_id}/{name}   -> serves generated media files
+  GET  /                                    serves webui/static/index.html
+  GET  /static/<path>                       static files
+  GET  /api/health                          health + orchestrator status
+  POST /api/orchestrator/probe              re-probe orchestrator
+  POST /api/conversations                   create a new conversation
+  GET  /api/conversations/{cid}             fetch messages + assets + jobs
+  POST /api/conversations/{cid}/messages    enqueue a user message (202)
+  GET  /api/conversations/{cid}/events      persistent SSE event channel
+  GET  /api/conversations/{cid}/jobs        list jobs in conversation
+  POST /api/conversations/{cid}/jobs/{jid}/cancel   request cancellation
+  GET  /api/conversations/{cid}/assets      list assets in conversation
+  GET  /api/media/{job_id}/{name}           serve generated media
+  GET  /api/uploads/{name}                  serve user-uploaded files
 
-Task dispatch (in `decide_task`):
+Task dispatch (Lance-native fallback when no orchestrator):
 
   attachment │ mode         │ task
   ───────────┼──────────────┼─────────────
@@ -867,6 +883,13 @@ from webui.orchestrator import (  # noqa: E402
     SYSTEM_PROMPT,
     file_to_data_url,
 )
+from webui.jobs import (  # noqa: E402
+    Asset,
+    EventBus,
+    JobRecord,
+    JobRunner,
+    new_id,
+)
 
 
 @dataclass
@@ -877,23 +900,34 @@ class ConvMessage:
     is what the UI shows: a list of bubbles (text, image, video, tool_call,
     tool_result). They diverge because the orchestrator sees data URLs for
     images while the UI shows server media URLs.
+
+    `tool_call_id` is set on role="tool" messages so we can locate and
+    back-fill them when an async job completes.
     """
     role: str                       # "system" | "user" | "assistant" | "tool"
     oai_message: Dict[str, Any]     # serializable for orchestrator
     display_blocks: List[Dict[str, Any]] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
+    tool_call_id: Optional[str] = None
+    job_id: Optional[str] = None    # set when this message is the orchestrator's queue-placeholder
 
 
 @dataclass
 class Conversation:
     id: str
     messages: List[ConvMessage] = field(default_factory=list)
+    assets: List[Asset] = field(default_factory=list)
+    jobs: Dict[str, JobRecord] = field(default_factory=dict)
+    events: EventBus = field(default_factory=EventBus)
+    # Per-conversation lock so orchestrator turns are serialized
+    turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Legacy "most-recent" pointers (still used by the Lance-native path
+    # and as the default target for edit_* when no asset_id is given).
     last_image_path: Optional[str] = None
     last_video_path: Optional[str] = None
 
     def append(self, m: ConvMessage) -> None:
         self.messages.append(m)
-        # Remember most recent visible media so edit_* tools have a target.
         for blk in m.display_blocks:
             if blk.get("kind") == "image":
                 self.last_image_path = blk.get("path") or self.last_image_path
@@ -903,6 +937,36 @@ class Conversation:
     def oai_messages(self) -> List[Dict[str, Any]]:
         return [m.oai_message for m in self.messages]
 
+    # ---- asset helpers -------------------------------------------------
+
+    def add_asset(self, asset: Asset) -> None:
+        self.assets.append(asset)
+        if asset.local_path:
+            if asset.kind == "image":
+                self.last_image_path = asset.local_path
+            elif asset.kind == "video":
+                self.last_video_path = asset.local_path
+
+    def find_asset(self, asset_id: str) -> Optional[Asset]:
+        for a in self.assets:
+            if a.id == asset_id:
+                return a
+        return None
+
+    def latest_asset(self, kind: str) -> Optional[Asset]:
+        for a in reversed(self.assets):
+            if a.kind == kind:
+                return a
+        return None
+
+    # ---- tool-message back-fill ----------------------------------------
+
+    def find_tool_message(self, tool_call_id: str) -> Optional[ConvMessage]:
+        for m in self.messages:
+            if m.role == "tool" and m.tool_call_id == tool_call_id:
+                return m
+        return None
+
 
 # ---------- App state -------------------------------------------------------
 
@@ -910,199 +974,332 @@ class AppState:
     def __init__(self):
         self.pipeline = LancePipeline(device=0)
         self.text = TextChatPipeline(device="cuda:0")
-        self.jobs: Dict[str, Job] = {}
-        self.queue: "asyncio.Queue[str]" = asyncio.Queue()
-        self.worker_task: Optional[asyncio.Task] = None
         # Orchestrator
         self.orch_settings = OrchSettings.from_env()
         self.orch_client = OrchestratorClient(self.orch_settings)
         self.orch_probe: Dict[str, Any] = {"reachable": False, "model": "", "models": [], "error": "not probed yet"}
         # Conversations
         self.conversations: Dict[str, Conversation] = {}
-        # Lock around Lance executor (only one job at a time on the GPU)
-        self.lance_lock = asyncio.Lock()
+        # Async job runtime (single FIFO worker, started in app startup)
+        self.runner: JobRunner = JobRunner(
+            get_conversation=self.conversations.get,
+            execute=self._lance_execute,
+            build_asset=self._build_asset,
+            backfill_tool_message=self._backfill_tool_message,
+        )
 
-    async def enqueue(self, job: Job) -> None:
-        self.jobs[job.id] = job
-        await self.queue.put(job.id)
-        if self.worker_task is None or self.worker_task.done():
-            self.worker_task = asyncio.create_task(self._worker())
+    # ---- callbacks invoked by JobRunner --------------------------------
 
-    async def _worker(self) -> None:
-        loop = asyncio.get_running_loop()
-        while True:
-            try:
-                job_id = await self.queue.get()
-            except asyncio.CancelledError:
-                return
-            job = self.jobs.get(job_id)
-            if job is None:
-                continue
-            job.status = "running"
-            job.started_at = time.time()
-            await self._emit(job, {"type": "started", "task": job.task})
-            try:
-                async with self.lance_lock:
-                    result = await loop.run_in_executor(None, self._execute, job)
-                job.result = result
-                job.status = "done"
-                job.finished_at = time.time()
-                await self._emit(job, {"type": "done", "result": result})
-            except Exception as e:  # noqa: BLE001
-                job.status = "error"
-                job.error = f"{type(e).__name__}: {e}"
-                job.finished_at = time.time()
-                tb = traceback.format_exc()
-                log(f"job {job.id} failed: {job.error}\n{tb}")
-                await self._emit(job, {"type": "error", "message": job.error})
+    def _lance_execute(self, job: JobRecord) -> Dict[str, Any]:
+        """Run a single Lance task synchronously inside the worker thread.
 
-    def _execute(self, job: Job) -> Dict[str, Any]:
-        if job.task == "text":
+        Bridges the JobRecord shape used by JobRunner to the legacy `Job`
+        shape that LancePipeline.run() expects.
+        """
+        if job.lance_task == "text":
             text = self.text.chat(
-                job.prompt, max_new_tokens=int(job.params.get("max_new_tokens", 512))
+                job.prompt, max_new_tokens=int(job.lance_params.get("max_new_tokens", 512))
             )
             return {"kind": "text", "text": text}
-        return self.pipeline.run(job)
+        legacy = Job(
+            id=job.id,
+            task=job.lance_task,
+            prompt=job.prompt,
+            attachment_path=job.attachment_path,
+            attachment_kind=job.attachment_kind,
+            params=dict(job.lance_params),
+        )
+        return self.pipeline.run(legacy)
 
-    async def _emit(self, job: Job, event: Dict[str, Any]) -> None:
-        if job.events is None:
-            job.events = asyncio.Queue()
-        await job.events.put(event)
+    def _build_asset(self, job: JobRecord, result: Dict[str, Any]) -> Optional[Asset]:
+        """Promote a finished media job to an Asset on its conversation."""
+        kind = result.get("kind")
+        if kind not in ("image", "video"):
+            return None
+        conv = self.conversations.get(job.conversation_id)
+        if conv is None:
+            return None
+        media_url = result.get("media_url", "")
+        local_path = None
+        m = re.match(r"^/api/media/([^/]+)/(.+)$", media_url)
+        if m:
+            local_path = str(RESULTS_DIR / m.group(1) / m.group(2))
+        asset = Asset(
+            id=new_id("a"),
+            conversation_id=conv.id,
+            kind=kind,
+            url=media_url,
+            filename=result.get("media_filename", ""),
+            caption=job.prompt,
+            source=job.tool,
+            job_id=job.id,
+            local_path=local_path,
+        )
+        conv.add_asset(asset)
+        return asset
 
-    # ---- Lance tool execution -----------------------------------------
-
-    async def execute_lance_tool(self, name: str, args: Dict[str, Any], conv: Conversation) -> Dict[str, Any]:
-        """Run a Lance tool synchronously (well, await the GPU executor).
-        Returns the result dict that's both stored on the conversation and
-        fed back to the orchestrator as the tool message content.
+    def _backfill_tool_message(
+        self,
+        job: JobRecord,
+        result: Dict[str, Any],
+        asset: Optional[Asset],
+    ) -> None:
+        """When an async job completes, rewrite the placeholder tool
+        message that originally said `{status: queued}` so that the next
+        orchestrator turn sees the real result in conversation history.
         """
-        loop = asyncio.get_running_loop()
+        if not job.tool_call_id:
+            return
+        conv = self.conversations.get(job.conversation_id)
+        if conv is None:
+            return
+        msg = conv.find_tool_message(job.tool_call_id)
+        if msg is None:
+            return
+        kind = result.get("kind")
+        if kind == "image":
+            text = (
+                f"Job {job.id} completed: image generated successfully "
+                f"(filename={result.get('media_filename', '')}). "
+                f"asset_id={asset.id if asset else 'unknown'}. "
+                f"The image is now visible in the chat."
+            )
+        elif kind == "video":
+            text = (
+                f"Job {job.id} completed: video generated successfully "
+                f"(filename={result.get('media_filename', '')}). "
+                f"asset_id={asset.id if asset else 'unknown'}. "
+                f"The video is now visible in the chat."
+            )
+        elif kind == "text":
+            text = result.get("text", "")
+        elif kind == "error":
+            text = f"Job {job.id} FAILED: {result.get('error', 'unknown error')}"
+        else:
+            text = f"Job {job.id} completed: {json.dumps(result, default=str)[:500]}"
+        msg.oai_message["content"] = text
 
-        if name == "generate_image":
+        # Patch the display block too so subsequent /api/conversations/{cid}
+        # reads (including page reloads) reflect the completion.
+        for blk in msg.display_blocks:
+            if blk.get("kind") == "tool_result" and blk.get("job_id") == job.id:
+                blk["status"] = "done" if kind != "error" else "error"
+                blk["elapsed"] = (job.finished_at or time.time()) - (job.started_at or job.created_at)
+                if kind in ("image", "video") and asset is not None:
+                    blk["media_url"] = asset.url
+                    blk["media_filename"] = asset.filename
+                    blk["kind_inner"] = asset.kind
+                    blk["asset_id"] = asset.id
+                if kind == "error":
+                    blk["error"] = result.get("error", "")
+                if kind == "text":
+                    blk["text"] = result.get("text", "")
+
+    # ---- factories used by message-handling code ----------------------
+
+    def make_job(
+        self,
+        conv: Conversation,
+        tool: str,
+        args: Dict[str, Any],
+        tool_call_id: Optional[str] = None,
+    ) -> JobRecord:
+        """Translate an orchestrator tool call into a JobRecord ready for
+        the JobRunner. Validates references like asset_id for edit_*.
+        """
+        if tool == "generate_image":
             aspect = args.get("aspect", "square")
             sizes = {"square": (768, 768), "landscape": (1024, 576), "portrait": (576, 1024)}
             w, h = sizes.get(aspect, (768, 768))
-            job = Job(
-                id=uuid.uuid4().hex, task="t2i",
+            return JobRecord(
+                id=new_id("j"), conversation_id=conv.id, tool=tool, args=dict(args),
+                lance_task="t2i",
+                lance_params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
+                              "height": h, "width": w, "resolution": "image_768res",
+                              "num_frames": 1, "timestep_shift": 3.5},
                 prompt=args.get("prompt", ""),
-                attachment_path=None, attachment_kind=None,
-                params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
-                        "height": h, "width": w, "resolution": "image_768res",
-                        "num_frames": 1, "timestep_shift": 3.5},
+                tool_call_id=tool_call_id,
             )
-        elif name == "generate_video":
+        if tool == "generate_video":
             res = args.get("resolution", "192p")
             res_map = {"192p": ("video_192p", 192, 320),
                        "360p": ("video_360p", 384, 640),
                        "480p": ("video_480p", 480, 832)}
             res_key, h, w = res_map.get(res, res_map["192p"])
             nf = int(args.get("num_frames", 49))
-            job = Job(
-                id=uuid.uuid4().hex, task="t2v",
+            return JobRecord(
+                id=new_id("j"), conversation_id=conv.id, tool=tool, args=dict(args),
+                lance_task="t2v",
+                lance_params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
+                              "height": h, "width": w, "resolution": res_key,
+                              "num_frames": nf, "timestep_shift": 3.5},
                 prompt=args.get("prompt", ""),
-                attachment_path=None, attachment_kind=None,
-                params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
-                        "height": h, "width": w, "resolution": res_key,
-                        "num_frames": nf, "timestep_shift": 3.5},
+                tool_call_id=tool_call_id,
             )
-        elif name == "edit_image":
-            if not conv.last_image_path:
-                raise ValueError("no image in conversation to edit")
-            job = Job(
-                id=uuid.uuid4().hex, task="image_edit",
+        if tool == "edit_image":
+            target_asset = None
+            asset_id = args.get("asset_id")
+            if asset_id:
+                target_asset = conv.find_asset(asset_id)
+                if target_asset is None or target_asset.kind != "image":
+                    raise ValueError(f"unknown image asset_id={asset_id}")
+            else:
+                target_asset = conv.latest_asset("image")
+            attachment_path = (target_asset.local_path
+                               if target_asset is not None
+                               else conv.last_image_path)
+            if not attachment_path:
+                raise ValueError("no image available to edit; ask the user to attach one or generate one first")
+            return JobRecord(
+                id=new_id("j"), conversation_id=conv.id, tool=tool, args=dict(args),
+                lance_task="image_edit",
+                lance_params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
+                              "height": 768, "width": 768, "resolution": "image_768res",
+                              "num_frames": 1, "timestep_shift": 3.5},
                 prompt=args.get("instruction", ""),
-                attachment_path=conv.last_image_path, attachment_kind="image",
-                params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
-                        "height": 768, "width": 768, "resolution": "image_768res",
-                        "num_frames": 1, "timestep_shift": 3.5},
+                attachment_path=attachment_path, attachment_kind="image",
+                tool_call_id=tool_call_id,
             )
-        elif name == "edit_video":
-            if not conv.last_video_path:
-                raise ValueError("no video in conversation to edit")
-            job = Job(
-                id=uuid.uuid4().hex, task="video_edit",
+        if tool == "edit_video":
+            target_asset = None
+            asset_id = args.get("asset_id")
+            if asset_id:
+                target_asset = conv.find_asset(asset_id)
+                if target_asset is None or target_asset.kind != "video":
+                    raise ValueError(f"unknown video asset_id={asset_id}")
+            else:
+                target_asset = conv.latest_asset("video")
+            attachment_path = (target_asset.local_path
+                               if target_asset is not None
+                               else conv.last_video_path)
+            if not attachment_path:
+                raise ValueError("no video available to edit")
+            return JobRecord(
+                id=new_id("j"), conversation_id=conv.id, tool=tool, args=dict(args),
+                lance_task="video_edit",
+                lance_params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
+                              "height": 480, "width": 832, "resolution": "video_480p",
+                              "num_frames": 81, "timestep_shift": 3.5},
                 prompt=args.get("instruction", ""),
-                attachment_path=conv.last_video_path, attachment_kind="video",
-                params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
-                        "height": 480, "width": 832, "resolution": "video_480p",
-                        "num_frames": 81, "timestep_shift": 3.5},
+                attachment_path=attachment_path, attachment_kind="video",
+                tool_call_id=tool_call_id,
             )
-        else:
-            raise ValueError(f"unknown tool: {name}")
-
-        self.jobs[job.id] = job
-        async with self.lance_lock:
-            result = await loop.run_in_executor(None, self._execute, job)
-        job.result = result
-        job.status = "done"
-        job.finished_at = time.time()
-        return result
+        raise ValueError(f"unknown generation tool: {tool}")
 
 
 state = AppState()
 
 
 # ---------------------------------------------------------------------------
-# Agentic conversation runner
+# Read-only orchestrator tools (synchronous state queries)
 # ---------------------------------------------------------------------------
 
-async def run_agentic_turn(
+READ_ONLY_TOOLS = {"list_jobs", "get_job", "list_assets", "get_asset", "cancel_job"}
+GENERATION_TOOLS = {"generate_image", "generate_video", "edit_image", "edit_video"}
+
+
+def execute_read_only_tool(name: str, args: Dict[str, Any], conv: Conversation) -> Dict[str, Any]:
+    """Synchronous (non-Lance) tools the orchestrator can call to inspect
+    or manipulate conversation state. Fast, no GPU.
+    """
+    if name == "list_jobs":
+        wanted = (args.get("status") or "all").lower()
+        limit = int(args.get("limit") or 20)
+        items = list(conv.jobs.values())
+        items.sort(key=lambda j: j.created_at, reverse=True)
+        if wanted == "active":
+            items = [j for j in items if j.status in ("queued", "running")]
+        elif wanted != "all":
+            items = [j for j in items if j.status == wanted]
+        items = items[:limit]
+        return {"count": len(items), "jobs": [j.short_dict() for j in items]}
+    if name == "get_job":
+        job_id = args.get("job_id", "")
+        job = conv.jobs.get(job_id)
+        if job is None:
+            return {"error": f"unknown job_id={job_id}"}
+        return {"job": job.public_dict()}
+    if name == "list_assets":
+        wanted = (args.get("kind") or "all").lower()
+        limit = int(args.get("limit") or 20)
+        items = list(conv.assets)
+        items.sort(key=lambda a: a.created_at, reverse=True)
+        if wanted != "all":
+            items = [a for a in items if a.kind == wanted]
+        items = items[:limit]
+        return {"count": len(items), "assets": [a.public_dict() for a in items]}
+    if name == "get_asset":
+        asset_id = args.get("asset_id", "")
+        asset = conv.find_asset(asset_id)
+        if asset is None:
+            return {"error": f"unknown asset_id={asset_id}"}
+        return {"asset": asset.public_dict()}
+    if name == "cancel_job":
+        job_id = args.get("job_id", "")
+        ok = state.runner.cancel(job_id, conversation_id=conv.id)
+        return {"cancelled": ok, "job_id": job_id}
+    raise ValueError(f"unknown read-only tool: {name}")
+
+
+# ---------------------------------------------------------------------------
+# User-message ingestion (shared by both paths)
+# ---------------------------------------------------------------------------
+
+def _record_user_message(
     conv: Conversation,
     user_prompt: str,
     user_attachment: Optional[Dict[str, Any]],
     output_mode: str,
-) -> AsyncIterator[Dict[str, Any]]:
-    """Append the user message to `conv`, then run the orchestrator loop
-    (possibly with tool calls) and yield SSE-ready event dicts.
-
-    Yields events of types:
-      start           {"task": "agentic" | "lance_native"}
-      text_delta      {"delta": str}
-      tool_start      {"id", "name", "args"}
-      tool_progress   {"id", "task", "elapsed"}
-      tool_result     {"id", "name", "result": {kind, ...}}
-      tool_error      {"id", "name", "error"}
-      media           {"kind", "media_url", "media_filename"}   # bare-Lance path
-      done            {}
-      error           {"message"}
+) -> None:
+    """Append the user's message to the conversation history and emit it
+    to the event bus. Handles attachments (image/video) — they become
+    user-uploaded assets so the orchestrator can list them too.
     """
-    yield {"type": "start", "task": "agentic"}
-
-    # 1) Append user message to conversation.
     display_blocks: List[Dict[str, Any]] = []
-    embed_user_images = state.orch_settings.embed_tool_images  # same flag
     image_blocks: List[Dict[str, Any]] = []
     extra_text_notes: List[str] = []
+    embed_user_images = state.orch_settings.embed_tool_images
 
     if user_prompt:
         display_blocks.append({"kind": "text", "text": user_prompt})
+
     if user_attachment:
         kind = user_attachment["kind"]
         path = Path(user_attachment["path"])
+        media_url = user_attachment.get("media_url", "")
+        display_blocks.append({
+            "kind": kind, "path": str(path), "media_url": media_url,
+            "filename": user_attachment.get("filename", path.name),
+        })
+        # Register the upload as an asset so the orchestrator can reference it
+        upload_asset = Asset(
+            id=new_id("a"),
+            conversation_id=conv.id,
+            kind=kind,
+            url=media_url,
+            filename=user_attachment.get("filename", path.name),
+            caption="(uploaded by user)",
+            source="user_upload",
+            local_path=str(path),
+        )
+        conv.add_asset(upload_asset)
         if kind == "image":
-            display_blocks.append({"kind": "image", "path": str(path),
-                                   "media_url": user_attachment.get("media_url", "")})
-            conv.last_image_path = str(path)
             if embed_user_images:
-                image_blocks.append({"type": "image_url",
-                                     "image_url": {"url": file_to_data_url(path)}})
+                image_blocks.append({
+                    "type": "image_url",
+                    "image_url": {"url": file_to_data_url(path)},
+                })
             else:
                 extra_text_notes.append(
-                    "[The user attached an image. You cannot see it directly with this model, "
-                    "but it's available as the most recent image for `edit_image`.]"
+                    f"[The user attached an image (asset_id={upload_asset.id}). "
+                    "Your orchestrator may not be vision-capable; the image is available as the most recent image for `edit_image`.]"
                 )
         elif kind == "video":
-            display_blocks.append({"kind": "video", "path": str(path),
-                                   "media_url": user_attachment.get("media_url", "")})
-            conv.last_video_path = str(path)
             extra_text_notes.append(
-                "[The user attached a video clip. You cannot view it directly, "
-                "but it's available as the most recent video for `edit_video`.]"
+                f"[The user attached a video clip (asset_id={upload_asset.id}). "
+                "It's available for `edit_video`.]"
             )
 
-    # Build OAI content. Use multimodal block form ONLY when we actually have
-    # image blocks AND the orchestrator is configured to accept them. Otherwise
-    # keep the safe string form.
     text_parts: List[str] = []
     if user_prompt:
         text_parts.append(user_prompt)
@@ -1114,16 +1311,13 @@ async def run_agentic_turn(
     else:
         user_oai_content = text_str
 
-    # Add a small system hint for explicit output modes.
-    if output_mode and output_mode != "auto" and output_mode != "text":
+    if output_mode and output_mode not in ("auto", "text"):
         mode_hint = {
             "image":      "The user prefers an image as the output of this turn — call generate_image or edit_image.",
             "video":      "The user prefers a video as the output of this turn — call generate_video or edit_video.",
             "understand": "The user wants a description / analysis of the attached media; do not call any tools.",
         }.get(output_mode)
-        if mode_hint and user_prompt:
-            # Bolt the hint onto the user message rather than the system msg
-            # so it scopes to this turn only.
+        if mode_hint:
             if isinstance(user_oai_content, list):
                 user_oai_content[0]["text"] += f"\n\n[output mode: {mode_hint}]"
             else:
@@ -1134,276 +1328,346 @@ async def run_agentic_turn(
         oai_message={"role": "user", "content": user_oai_content},
         display_blocks=display_blocks,
     ))
+    conv.events.emit("message_appended", {
+        "role": "user",
+        "index": len(conv.messages) - 1,
+        "display_blocks": display_blocks,
+        "created_at": conv.messages[-1].created_at,
+    })
 
-    # 2) Build messages for the orchestrator: system prompt + history.
-    base_messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT}
-    ]
+
+# ---------------------------------------------------------------------------
+# Agentic conversation runner — emits to event bus, async-submits Lance jobs
+# ---------------------------------------------------------------------------
+
+async def run_agentic_turn(conv: Conversation) -> None:
+    """Run a single orchestrator turn on `conv`. Streams text deltas and
+    issues tool calls; generation tools submit async jobs and immediately
+    feed `{job_id, status: queued}` back to the orchestrator. The turn
+    finishes when the orchestrator stops emitting tool calls.
+
+    Output is pushed to `conv.events` (the persistent SSE bus). Errors
+    are caught and emitted as `error` events; this coroutine never
+    raises out.
+    """
+    turn_id = new_id("t")
+    conv.events.emit("turn_started", {"turn_id": turn_id, "mode": "agentic"})
+
+    # Build messages: system prompt + brief situation header + history.
+    sit_lines = _situation_header(conv)
+    system_content = SYSTEM_PROMPT
+    if sit_lines:
+        system_content = SYSTEM_PROMPT + "\n\n# Current context\n" + sit_lines
+    base_messages: List[Dict[str, Any]] = [{"role": "system", "content": system_content}]
     base_messages.extend(conv.oai_messages())
 
-    # 3) Loop: call orchestrator → if tool calls, execute them and re-call.
-    max_tool_rounds = 6
-    for round_idx in range(max_tool_rounds):
-        accumulated_text = ""
-        accumulated_tool_calls: List[Dict[str, Any]] = []
-        try:
-            async for evt in state.orch_client.stream_chat(base_messages, tools=LANCE_TOOLS):
-                if evt["type"] == "text":
-                    accumulated_text += evt["delta"]
-                    yield {"type": "text_delta", "delta": evt["delta"]}
-                elif evt["type"] == "tool_call_done":
-                    accumulated_tool_calls = evt["calls"]
-                elif evt["type"] == "stop":
-                    break
-        except Exception as e:  # noqa: BLE001
-            yield {"type": "error", "message": f"orchestrator failure: {type(e).__name__}: {e}"}
-            return
-
-        # Construct the assistant message. OpenAI format requires tool_calls to
-        # be the function-call structure.
-        assistant_msg: Dict[str, Any] = {"role": "assistant"}
-        if accumulated_text:
-            assistant_msg["content"] = accumulated_text
-        else:
-            assistant_msg["content"] = None
-        if accumulated_tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": json.dumps(tc["arguments"]),
-                    },
-                }
-                for tc in accumulated_tool_calls
-            ]
-
-        # Record on conversation
-        ad_blocks: List[Dict[str, Any]] = []
-        if accumulated_text:
-            ad_blocks.append({"kind": "text", "text": accumulated_text})
-        conv.append(ConvMessage(
-            role="assistant",
-            oai_message=assistant_msg,
-            display_blocks=ad_blocks,
-        ))
-        base_messages.append(assistant_msg)
-
-        # If no tool calls → we're done.
-        if not accumulated_tool_calls:
-            break
-
-        # Execute tool calls.
-        any_failed = False
-        for tc in accumulated_tool_calls:
-            yield {
-                "type": "tool_start",
-                "id": tc["id"], "name": tc["name"], "args": tc["arguments"],
-            }
-            tool_t0 = time.time()
+    try:
+        max_tool_rounds = 6
+        for _round_idx in range(max_tool_rounds):
+            accumulated_text = ""
+            accumulated_tool_calls: List[Dict[str, Any]] = []
             try:
-                tool_result = await state.execute_lance_tool(tc["name"], tc["arguments"], conv)
+                async for evt in state.orch_client.stream_chat(base_messages, tools=LANCE_TOOLS):
+                    if evt["type"] == "text":
+                        accumulated_text += evt["delta"]
+                        conv.events.emit("text_delta", {"turn_id": turn_id, "delta": evt["delta"]})
+                    elif evt["type"] == "tool_call_done":
+                        accumulated_tool_calls = evt["calls"]
+                    elif evt["type"] == "stop":
+                        break
             except Exception as e:  # noqa: BLE001
-                err = f"{type(e).__name__}: {e}"
-                log(f"tool {tc['name']} failed: {err}\n{traceback.format_exc()}")
-                yield {"type": "tool_error", "id": tc["id"], "name": tc["name"], "error": err}
-                # Tell the orchestrator the tool failed
-                tool_oai = {"role": "tool", "tool_call_id": tc["id"], "content": f"Tool failed: {err}"}
+                err = f"orchestrator failure: {type(e).__name__}: {e}"
+                log(err)
+                conv.events.emit("error", {"turn_id": turn_id, "message": err})
+                conv.events.emit("turn_ended", {"turn_id": turn_id, "status": "error"})
+                return
+
+            # Record the assistant message (text only at first).
+            assistant_msg: Dict[str, Any] = {"role": "assistant"}
+            assistant_msg["content"] = accumulated_text if accumulated_text else None
+            if accumulated_tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": json.dumps(tc["arguments"]),
+                        },
+                    }
+                    for tc in accumulated_tool_calls
+                ]
+
+            ad_blocks: List[Dict[str, Any]] = []
+            if accumulated_text:
+                ad_blocks.append({"kind": "text", "text": accumulated_text})
+            conv.append(ConvMessage(
+                role="assistant",
+                oai_message=assistant_msg,
+                display_blocks=ad_blocks,
+            ))
+            base_messages.append(assistant_msg)
+            conv.events.emit("message_appended", {
+                "role": "assistant",
+                "index": len(conv.messages) - 1,
+                "display_blocks": ad_blocks,
+                "created_at": conv.messages[-1].created_at,
+            })
+
+            if not accumulated_tool_calls:
+                break
+
+            # Process tool calls.
+            for tc in accumulated_tool_calls:
+                name = tc["name"]
+                args = tc.get("arguments") or {}
+                conv.events.emit("tool_call", {
+                    "tool_call_id": tc["id"],
+                    "name": name,
+                    "args": args,
+                })
+
+                # --- Read-only / state-query tools: execute synchronously
+                if name in READ_ONLY_TOOLS:
+                    ro_result: Dict[str, Any] = {}
+                    try:
+                        ro_result = execute_read_only_tool(name, args, conv)
+                        tool_text = json.dumps(ro_result, default=str)
+                        kind = "info"
+                    except Exception as e:  # noqa: BLE001
+                        err = f"{type(e).__name__}: {e}"
+                        ro_result = {"error": err}
+                        tool_text = json.dumps(ro_result)
+                        kind = "error"
+                    tool_oai = {"role": "tool", "tool_call_id": tc["id"], "content": tool_text}
+                    conv.append(ConvMessage(
+                        role="tool",
+                        oai_message=tool_oai,
+                        display_blocks=[{"kind": "tool_result", "name": name,
+                                         "text": tool_text[:300],
+                                         "status": "done" if kind == "info" else "error"}],
+                        tool_call_id=tc["id"],
+                    ))
+                    base_messages.append(tool_oai)
+                    conv.events.emit("tool_result", {
+                        "tool_call_id": tc["id"],
+                        "name": name,
+                        "result": ro_result,
+                        "kind": kind,
+                    })
+                    continue
+
+                # --- Generation tools: submit a Job, return queued envelope
+                if name in GENERATION_TOOLS:
+                    try:
+                        job = state.make_job(conv, name, args, tool_call_id=tc["id"])
+                    except Exception as e:  # noqa: BLE001
+                        err = f"{type(e).__name__}: {e}"
+                        log(f"submit {name} failed: {err}")
+                        tool_oai = {"role": "tool", "tool_call_id": tc["id"],
+                                    "content": json.dumps({"error": err})}
+                        conv.append(ConvMessage(
+                            role="tool",
+                            oai_message=tool_oai,
+                            display_blocks=[{"kind": "tool_error", "name": name, "error": err}],
+                            tool_call_id=tc["id"],
+                        ))
+                        base_messages.append(tool_oai)
+                        conv.events.emit("tool_result", {
+                            "tool_call_id": tc["id"],
+                            "name": name,
+                            "result": {"error": err},
+                            "kind": "error",
+                        })
+                        continue
+
+                    # Submit (non-blocking)
+                    state.runner.submit(job)
+                    queued_payload = {
+                        "job_id": job.id,
+                        "status": "queued",
+                        "message": (
+                            f"Job {job.id} ({name}) has been queued. "
+                            f"It will run in the background and the result will appear "
+                            f"in the chat automatically when complete (~{_eta_hint(name, args)}). "
+                            f"You can call list_jobs() to check progress, or simply respond to the user "
+                            f"with a brief acknowledgement now — do NOT call this tool again."
+                        ),
+                    }
+                    tool_text = json.dumps(queued_payload)
+                    tool_oai = {"role": "tool", "tool_call_id": tc["id"], "content": tool_text}
+                    # Placeholder display block — JobRunner back-fills it when done.
+                    placeholder = {
+                        "kind": "tool_result",
+                        "name": name,
+                        "job_id": job.id,
+                        "tool_call_id": tc["id"],
+                        "args": args,
+                        "status": "queued",
+                        "elapsed": 0.0,
+                    }
+                    conv.append(ConvMessage(
+                        role="tool",
+                        oai_message=tool_oai,
+                        display_blocks=[placeholder],
+                        tool_call_id=tc["id"],
+                        job_id=job.id,
+                    ))
+                    base_messages.append(tool_oai)
+                    conv.events.emit("tool_result", {
+                        "tool_call_id": tc["id"],
+                        "name": name,
+                        "job_id": job.id,
+                        "result": queued_payload,
+                        "kind": "queued",
+                    })
+                    continue
+
+                # Unknown tool
+                err = f"unknown tool {name!r}"
+                tool_oai = {"role": "tool", "tool_call_id": tc["id"],
+                            "content": json.dumps({"error": err})}
                 conv.append(ConvMessage(
-                    role="tool",
-                    oai_message=tool_oai,
-                    display_blocks=[{"kind": "tool_error", "name": tc["name"], "error": err}],
+                    role="tool", oai_message=tool_oai,
+                    display_blocks=[{"kind": "tool_error", "name": name, "error": err}],
+                    tool_call_id=tc["id"],
                 ))
                 base_messages.append(tool_oai)
-                any_failed = True
-                continue
+                conv.events.emit("tool_result", {
+                    "tool_call_id": tc["id"], "name": name,
+                    "result": {"error": err}, "kind": "error",
+                })
 
-            elapsed = time.time() - tool_t0
-            yield {"type": "tool_result", "id": tc["id"], "name": tc["name"],
-                   "result": tool_result, "elapsed": elapsed}
+        conv.events.emit("turn_ended", {"turn_id": turn_id, "status": "ok"})
+    except Exception as e:  # noqa: BLE001
+        log(f"agentic turn crashed: {e}\n{traceback.format_exc()}")
+        conv.events.emit("error", {"turn_id": turn_id, "message": str(e)})
+        conv.events.emit("turn_ended", {"turn_id": turn_id, "status": "error"})
 
-            # Build the tool message + display block.
-            #
-            # IMPORTANT: tool messages MUST have plain-string content for
-            # broad OAI-compatibility (LM Studio, vLLM, llama.cpp server all
-            # reject multimodal content blocks on role=tool). If we want a
-            # vision-capable orchestrator to actually *see* the generated
-            # image, we append a follow-up user message after the tool
-            # result with the image as an image_url block. This is opt-in
-            # via the orchestrator_embed_tool_images flag because many
-            # local models aren't VLMs.
-            display: Dict[str, Any] = {"kind": "tool_result", "name": tc["name"]}
-            tool_text = ""
-            follow_up_image_path: Optional[Path] = None
 
-            if tool_result.get("kind") == "image":
-                rel_url = tool_result["media_url"]
-                fname = tool_result["media_filename"]
-                m = re.match(r"^/api/media/([^/]+)/(.+)$", rel_url)
-                if m:
-                    src = RESULTS_DIR / m.group(1) / m.group(2)
-                    if src.exists():
-                        display.update({"media_url": rel_url, "media_filename": fname,
-                                        "kind_inner": "image", "path": str(src)})
-                        conv.last_image_path = str(src)
-                        follow_up_image_path = src
-                tool_text = (
-                    f"Successfully generated image (filename={fname}). "
-                    f"The image is now shown to the user in the chat. "
-                    f"Respond with a brief, friendly confirmation."
-                )
-            elif tool_result.get("kind") == "video":
-                rel_url = tool_result["media_url"]
-                fname = tool_result["media_filename"]
-                m = re.match(r"^/api/media/([^/]+)/(.+)$", rel_url)
-                if m:
-                    src = RESULTS_DIR / m.group(1) / m.group(2)
-                    if src.exists():
-                        display.update({"media_url": rel_url, "media_filename": fname,
-                                        "kind_inner": "video", "path": str(src)})
-                        conv.last_video_path = str(src)
-                tool_text = (
-                    f"Successfully generated video clip (filename={fname}). "
-                    f"It is now shown to the user. Respond with a brief confirmation."
-                )
-            elif tool_result.get("kind") == "text":
-                tool_text = tool_result.get("text", "")
-            else:
-                tool_text = json.dumps(tool_result, default=str)[:1000]
+def _situation_header(conv: Conversation) -> str:
+    """A compact situational summary prepended to the system prompt so the
+    orchestrator is aware of pending jobs and prior assets without having
+    to call list_jobs() every turn."""
+    lines: List[str] = []
+    active = [j for j in conv.jobs.values() if j.status in ("queued", "running")]
+    done = [j for j in conv.jobs.values() if j.status == "done"]
+    if active:
+        lines.append(f"- {len(active)} job(s) currently {','.join(sorted({j.status for j in active}))}. "
+                     f"Oldest started {_relative_ago(min(j.started_at or j.created_at for j in active))} ago.")
+        for j in active[:4]:
+            lines.append(f"    job {j.id} {j.tool} \"{j.prompt[:80]}\"")
+    if conv.assets:
+        kinds = {}
+        for a in conv.assets:
+            kinds[a.kind] = kinds.get(a.kind, 0) + 1
+        summary = ", ".join(f"{n} {k}{'s' if n != 1 else ''}" for k, n in kinds.items())
+        lines.append(f"- {len(conv.assets)} asset(s) in chat ({summary}). Use list_assets() to inspect.")
+    if done:
+        lines.append(f"- {len(done)} previous generation job(s) completed.")
+    return "\n".join(lines)
 
-            tool_oai = {"role": "tool", "tool_call_id": tc["id"], "content": tool_text}
-            conv.append(ConvMessage(
-                role="tool",
-                oai_message=tool_oai,
-                display_blocks=[display],
-            ))
-            base_messages.append(tool_oai)
 
-            # Optionally let a VLM orchestrator actually see the image.
-            if (follow_up_image_path is not None
-                    and getattr(state.orch_settings, "embed_tool_images", False)):
-                follow_up_msg = {
-                    "role": "user",
-                    "content": [
-                        {"type": "text",
-                         "text": "[Above is the image just generated by the tool and shown to the user. Briefly confirm to the user, in 1-2 sentences.]"},
-                        {"type": "image_url",
-                         "image_url": {"url": file_to_data_url(follow_up_image_path)}},
-                    ],
-                }
-                conv.append(ConvMessage(
-                    role="user",
-                    oai_message=follow_up_msg,
-                    display_blocks=[],  # not shown in UI; it's a system-driven nudge
-                ))
-                base_messages.append(follow_up_msg)
+def _relative_ago(ts: float) -> str:
+    s = max(0.0, time.time() - ts)
+    if s < 60: return f"{int(s)}s"
+    if s < 3600: return f"{int(s/60)}m"
+    return f"{int(s/3600)}h"
 
-        if any_failed:
-            # Still let the orchestrator respond to the failure once.
-            continue
-        # Loop around: orchestrator now sees the tool results and can respond.
 
-    yield {"type": "done"}
+def _eta_hint(tool: str, args: Dict[str, Any]) -> str:
+    if tool == "generate_image": return "2 min"
+    if tool == "edit_image":     return "1 min"
+    if tool == "edit_video":     return "26 min"
+    if tool == "generate_video":
+        res = args.get("resolution", "192p")
+        return {"192p": "3 min", "360p": "8 min", "480p": "26 min"}.get(res, "5 min")
+    return "a moment"
 
 
 # ---------------------------------------------------------------------------
 # Native-Lance turn runner (fallback when orchestrator is unreachable)
 # ---------------------------------------------------------------------------
 
-async def run_lance_native_turn(
-    conv: Conversation,
-    user_prompt: str,
-    user_attachment: Optional[Dict[str, Any]],
-    output_mode: str,
-) -> AsyncIterator[Dict[str, Any]]:
-    """Pre-orchestrator behavior: use decide_task() to pick a task, run it,
-    emit the result. No tool calling, no chat memory beyond what Lance sees.
+async def run_lance_native_turn(conv: Conversation, user_prompt: str,
+                                user_attachment: Optional[Dict[str, Any]],
+                                output_mode: str) -> None:
+    """Pre-orchestrator behavior: use decide_task() to pick a task, submit
+    a job (async, like the agentic path), then return. The frontend sees
+    the result land via job_completed on the event bus.
     """
-    yield {"type": "start", "task": "lance_native"}
+    turn_id = new_id("t")
+    conv.events.emit("turn_started", {"turn_id": turn_id, "mode": "lance_native"})
 
     att_kind = user_attachment["kind"] if user_attachment else None
     task = decide_task(user_prompt, output_mode, att_kind)
 
-    # Show the user message in the display layer so we have a record.
-    user_display = []
-    if user_prompt:
-        user_display.append({"kind": "text", "text": user_prompt})
-    if user_attachment:
-        user_display.append({
-            "kind": user_attachment["kind"],
-            "path": user_attachment["path"],
-            "media_url": user_attachment.get("media_url", ""),
-        })
-    conv.append(ConvMessage(
-        role="user",
-        oai_message={"role": "user", "content": user_prompt or ""},
-        display_blocks=user_display,
-    ))
+    if task == "text":
+        # Text fallback runs through the same job queue so the UI sees a
+        # consistent job lifecycle.
+        job = JobRecord(
+            id=new_id("j"), conversation_id=conv.id, tool="text_chat",
+            args={"prompt": user_prompt}, lance_task="text",
+            lance_params={"max_new_tokens": 512},
+            prompt=user_prompt,
+        )
+        # Add a placeholder tool_result so the UI shows progress and the
+        # back-fill replaces it with the text answer.
+        placeholder_tc_id = new_id("tc")
+        job.tool_call_id = placeholder_tc_id
+        tool_text = json.dumps({"job_id": job.id, "status": "queued"})
+        conv.append(ConvMessage(
+            role="tool",
+            oai_message={"role": "tool", "tool_call_id": placeholder_tc_id, "content": tool_text},
+            display_blocks=[{
+                "kind": "tool_result", "name": "text_chat", "job_id": job.id,
+                "tool_call_id": placeholder_tc_id, "args": {"prompt": user_prompt},
+                "status": "queued", "elapsed": 0.0,
+            }],
+            tool_call_id=placeholder_tc_id, job_id=job.id,
+        ))
+        state.runner.submit(job)
+        conv.events.emit("turn_ended", {"turn_id": turn_id, "status": "ok"})
+        return
 
-    job = Job(
-        id=uuid.uuid4().hex, task=task,
+    # Media task — t2i / t2v / image_edit / video_edit / x2t_*
+    job_params = {
+        "steps": 30, "cfg_text_scale": 4.0, "seed": 42,
+        "height": 768 if task in ("t2i", "image_edit") else 480,
+        "width":  768 if task in ("t2i", "image_edit") else 832,
+        "resolution": "image_768res" if task in ("t2i", "image_edit", "x2t_image") else "video_480p",
+        "num_frames": 1 if task in ("t2i", "image_edit", "x2t_image") else 81,
+        "timestep_shift": 3.5,
+    }
+    tool_name = {
+        "t2i": "generate_image", "t2v": "generate_video",
+        "image_edit": "edit_image", "video_edit": "edit_video",
+        "x2t_image": "describe_image", "x2t_video": "describe_video",
+    }.get(task, task)
+    placeholder_tc_id = new_id("tc")
+    job = JobRecord(
+        id=new_id("j"), conversation_id=conv.id, tool=tool_name,
+        args={"prompt": user_prompt} if task in ("t2i", "t2v") else {"instruction": user_prompt},
+        lance_task=task, lance_params=job_params,
         prompt=user_prompt,
         attachment_path=user_attachment["path"] if user_attachment else None,
         attachment_kind=att_kind,
-        params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
-                "height": 768 if task in ("t2i", "image_edit") else 480,
-                "width":  768 if task in ("t2i", "image_edit") else 832,
-                "resolution": "image_768res" if task in ("t2i", "image_edit", "x2t_image") else "video_480p",
-                "num_frames": 1 if task in ("t2i", "image_edit", "x2t_image") else 81,
-                "timestep_shift": 3.5},
+        tool_call_id=placeholder_tc_id,
     )
-    state.jobs[job.id] = job
-
-    yield {"type": "tool_start", "id": job.id, "name": task, "args": {"prompt": user_prompt}}
-
-    loop = asyncio.get_running_loop()
-    try:
-        async with state.lance_lock:
-            result = await loop.run_in_executor(None, state._execute, job)
-    except Exception as e:  # noqa: BLE001
-        err = f"{type(e).__name__}: {e}"
-        log(f"native task {task} failed: {err}\n{traceback.format_exc()}")
-        yield {"type": "tool_error", "id": job.id, "name": task, "error": err}
-        yield {"type": "done"}
-        return
-
-    job.result = result
-    job.status = "done"
-    job.finished_at = time.time()
-
-    yield {"type": "tool_result", "id": job.id, "name": task, "result": result, "elapsed": 0.0}
-
-    # Add an assistant display block for the result.
-    ad_blocks: List[Dict[str, Any]] = []
-    if result.get("kind") == "text":
-        ad_blocks.append({"kind": "text", "text": result.get("text", "")})
-    else:
-        ad_blocks.append({
-            "kind": "tool_result", "name": task,
-            "media_url": result.get("media_url", ""),
-            "media_filename": result.get("media_filename", ""),
-            "kind_inner": result.get("kind"),
-        })
-
-    # Remember media for potential follow-up
-    if result.get("kind") in ("image", "video"):
-        rel = result.get("media_url", "")
-        m = re.match(r"^/api/media/([^/]+)/(.+)$", rel)
-        if m:
-            src = RESULTS_DIR / m.group(1) / m.group(2)
-            if result["kind"] == "image":
-                conv.last_image_path = str(src)
-            else:
-                conv.last_video_path = str(src)
-
+    # Synthetic placeholder tool message so UI/back-fill works the same way
+    tool_text = json.dumps({"job_id": job.id, "status": "queued"})
     conv.append(ConvMessage(
-        role="assistant",
-        oai_message={"role": "assistant", "content": result.get("text", "")},
-        display_blocks=ad_blocks,
+        role="tool",
+        oai_message={"role": "tool", "tool_call_id": placeholder_tc_id, "content": tool_text},
+        display_blocks=[{
+            "kind": "tool_result", "name": tool_name, "job_id": job.id,
+            "tool_call_id": placeholder_tc_id, "args": {"prompt": user_prompt},
+            "status": "queued", "elapsed": 0.0,
+        }],
+        tool_call_id=placeholder_tc_id, job_id=job.id,
     ))
-
-    yield {"type": "done"}
+    state.runner.submit(job)
+    conv.events.emit("turn_ended", {"turn_id": turn_id, "status": "ok"})
 
 
 # ---------- FastAPI app -----------------------------------------------------
@@ -1421,12 +1685,19 @@ app.mount("/static", StaticFiles(directory=str(WEBUI_DIR / "static")), name="sta
 
 @app.get("/api/health")
 async def health() -> Dict[str, Any]:
+    snap = state.runner.queue_snapshot()
+    total_jobs = sum(len(c.jobs) for c in state.conversations.values())
+    active_jobs = sum(1 for c in state.conversations.values() for j in c.jobs.values()
+                      if j.status in ("queued", "running"))
     return {
         "ready": state.pipeline.initialized,
         "text_ready": state.text.initialized,
         "device": str(state.pipeline.device),
-        "queue_depth": state.queue.qsize(),
-        "jobs": len(state.jobs),
+        "queue_depth": snap["depth"],
+        "current_job": snap["current"],
+        "active_jobs": active_jobs,
+        "total_jobs": total_jobs,
+        "conversations": len(state.conversations),
         "orchestrator": {
             "configured": bool(state.orch_settings.base_url),
             "base_url": state.orch_settings.base_url,
@@ -1446,89 +1717,6 @@ async def orchestrator_probe() -> Dict[str, Any]:
     return state.orch_probe
 
 
-@app.post("/api/jobs")
-async def create_job(
-    prompt: str = Form(""),
-    mode: str = Form("auto"),
-    seed: int = Form(42),
-    steps: int = Form(30),
-    cfg_text_scale: float = Form(4.0),
-    timestep_shift: float = Form(3.5),
-    num_frames: int = Form(81),
-    resolution: str = Form("video_480p"),
-    attachment: Optional[UploadFile] = File(None),
-) -> Dict[str, Any]:
-    attachment_path: Optional[str] = None
-    attachment_kind: Optional[str] = None
-    if attachment is not None and attachment.filename:
-        # Persist upload
-        job_id_pre = uuid.uuid4().hex
-        suffix = Path(attachment.filename).suffix or ".bin"
-        save_to = UPLOADS_DIR / f"{job_id_pre}{suffix}"
-        with save_to.open("wb") as f:
-            shutil.copyfileobj(attachment.file, f)
-        attachment_path = str(save_to)
-        attachment_kind = detect_attachment_kind(attachment.filename, attachment.content_type)
-
-    task = decide_task(prompt, mode, attachment_kind)
-    job = Job(
-        id=uuid.uuid4().hex,
-        task=task,
-        prompt=prompt,
-        attachment_path=attachment_path,
-        attachment_kind=attachment_kind,
-        params={
-            "seed": seed,
-            "steps": steps,
-            "cfg_text_scale": cfg_text_scale,
-            "timestep_shift": timestep_shift,
-            "num_frames": num_frames,
-            "resolution": resolution,
-        },
-    )
-    await state.enqueue(job)
-    log(f"queued job {job.id} task={task} mode={mode} attach={attachment_kind}")
-    return {"job_id": job.id, "task": task, "queue_position": state.queue.qsize()}
-
-
-@app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str) -> Dict[str, Any]:
-    job = state.jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="job not found")
-    return job.public_dict()
-
-
-@app.get("/api/jobs/{job_id}/events")
-async def events(job_id: str, request: Request) -> StreamingResponse:
-    job = state.jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="job not found")
-    if job.events is None:
-        job.events = asyncio.Queue()
-
-    async def stream():
-        # Emit current state immediately
-        snapshot = job.public_dict()
-        yield f"data: {json.dumps({'type': 'state', **snapshot})}\n\n"
-
-        # Then stream incremental events
-        while True:
-            if await request.is_disconnected():
-                return
-            try:
-                event = await asyncio.wait_for(job.events.get(), timeout=15.0)
-            except asyncio.TimeoutError:
-                yield ": ping\n\n"
-                continue
-            event = {**event, "id": job.id, "status": job.status}
-            yield f"data: {json.dumps(event)}\n\n"
-            if event.get("type") in ("done", "error"):
-                return
-
-    return StreamingResponse(stream(), media_type="text/event-stream")
-
-
 @app.get("/api/media/{job_id}/{name}")
 async def media(job_id: str, name: str) -> FileResponse:
     path = RESULTS_DIR / job_id / name
@@ -1538,37 +1726,29 @@ async def media(job_id: str, name: str) -> FileResponse:
     return FileResponse(path, media_type=mt or "application/octet-stream")
 
 
-# ---------- Optional: prefetch a media file as an "upload" -------------
-
-@app.post("/api/jobs/{job_id}/reattach")
-async def reattach(job_id: str) -> Dict[str, Any]:
-    """Returns a server-local path to job's output media so the frontend can
-    reference it as the attachment for a follow-up edit without re-uploading.
-    """
-    job = state.jobs.get(job_id)
-    if job is None or job.status != "done":
-        raise HTTPException(status_code=404, detail="job not done")
-    if job.result.get("kind") not in ("image", "video"):
-        raise HTTPException(status_code=400, detail="no media to reattach")
-    name = job.result["media_filename"]
-    src = RESULTS_DIR / job_id / name
-    if not src.exists():
-        raise HTTPException(status_code=404, detail="media file missing")
-    # Copy into uploads so user can chain edits without re-uploading
-    new_id = uuid.uuid4().hex
-    dst = UPLOADS_DIR / f"{new_id}{src.suffix}"
-    shutil.copy2(src, dst)
-    return {"attachment_path": str(dst), "kind": job.result["kind"], "filename": src.name}
+@app.get("/api/uploads/{name}")
+async def serve_upload(name: str) -> FileResponse:
+    """Serve a user-uploaded file (also used to render user-attached images
+    in the chat history)."""
+    path = UPLOADS_DIR / name
+    if not path.exists():
+        raise HTTPException(404, "upload not found")
+    mt, _ = mimetypes.guess_type(name)
+    return FileResponse(path, media_type=mt or "application/octet-stream")
 
 
 # ---------------------------------------------------------------------------
-# Conversations API (agentic chat with optional orchestrator)
+# Conversations API
 # ---------------------------------------------------------------------------
 
 @app.post("/api/conversations")
 async def create_conversation() -> Dict[str, Any]:
     cid = uuid.uuid4().hex
-    state.conversations[cid] = Conversation(id=cid)
+    conv = Conversation(id=cid)
+    # Bind the bus to the running loop now so JobRunner emissions schedule
+    # correctly.
+    conv.events.bind_loop(asyncio.get_running_loop())
+    state.conversations[cid] = conv
     log(f"created conversation {cid}")
     return {"conversation_id": cid}
 
@@ -1581,9 +1761,14 @@ async def get_conversation(cid: str) -> Dict[str, Any]:
     return {
         "id": conv.id,
         "messages": [
-            {"role": m.role, "display_blocks": m.display_blocks, "created_at": m.created_at}
+            {"role": m.role, "display_blocks": m.display_blocks,
+             "created_at": m.created_at,
+             "tool_call_id": m.tool_call_id, "job_id": m.job_id}
             for m in conv.messages
         ],
+        "assets": [a.public_dict() for a in conv.assets],
+        "jobs":   [j.public_dict() for j in conv.jobs.values()],
+        "latest_event_seq": conv.events.latest_seq,
     }
 
 
@@ -1594,17 +1779,16 @@ async def post_message(
     mode: str = Form("auto"),
     use_orchestrator: bool = Form(True),
     attachment: Optional[UploadFile] = File(None),
-) -> StreamingResponse:
-    """Send a user message into a conversation and stream the response.
-
-    Stream is SSE; events use the schema defined in run_agentic_turn /
-    run_lance_native_turn.
+) -> JSONResponse:
+    """Enqueue a user message. Non-blocking: returns 202 with `{queued: true}`
+    and the actual orchestrator/Lance work happens off the request thread.
+    All output flows through the conversation's persistent SSE channel
+    (/api/conversations/{cid}/events).
     """
     conv = state.conversations.get(cid)
     if conv is None:
         raise HTTPException(404, "conversation not found")
 
-    # Persist any attachment.
     user_att: Optional[Dict[str, Any]] = None
     if attachment is not None and attachment.filename:
         suffix = Path(attachment.filename).suffix or ".bin"
@@ -1622,42 +1806,122 @@ async def post_message(
             "filename": attachment.filename,
         }
 
-    # Decide which runner to use.
     use_agentic = use_orchestrator and state.orch_probe.get("reachable", False)
+    log(f"conv {cid} new msg (orchestrator={'agentic' if use_agentic else 'native'}, "
+        f"attach={user_att['kind'] if user_att else None})")
+
+    # Record the user message synchronously (so the event order is sane)
+    _record_user_message(conv, prompt, user_att, mode)
+
+    # Kick off the turn task (non-blocking).
+    asyncio.create_task(_run_turn_serialized(conv, prompt, user_att, mode, use_agentic))
+
+    return JSONResponse({"queued": True, "conversation_id": cid}, status_code=202)
+
+
+async def _run_turn_serialized(conv: Conversation, prompt: str,
+                               user_att: Optional[Dict[str, Any]], mode: str,
+                               use_agentic: bool) -> None:
+    """Wrap a turn in the conversation's turn lock so concurrent user
+    messages serialize cleanly. The lock has no effect on long-running
+    Lance jobs because those are now async / detached."""
+    async with conv.turn_lock:
+        try:
+            if use_agentic:
+                await run_agentic_turn(conv)
+            else:
+                await run_lance_native_turn(conv, prompt, user_att, mode)
+        except Exception as e:  # noqa: BLE001
+            log(f"turn crashed for conv {conv.id}: {e}\n{traceback.format_exc()}")
+            conv.events.emit("error", {"message": f"turn crashed: {e}"})
+
+
+@app.get("/api/conversations/{cid}/events")
+async def conversation_events(cid: str, request: Request, from_seq: int = 0) -> StreamingResponse:
+    """Persistent SSE stream of all events for a conversation.
+
+    The client should open this once per page load and keep it open. On
+    reconnect, pass `?from_seq=N+1` where N is the last seq seen so the
+    server replays anything missed.
+    """
+    conv = state.conversations.get(cid)
+    if conv is None:
+        raise HTTPException(404, "conversation not found")
+    conv.events.bind_loop(asyncio.get_running_loop())
 
     async def stream() -> AsyncIterator[bytes]:
-        runner = run_agentic_turn if use_agentic else run_lance_native_turn
+        # 1) Replay any events from cursor onward (this catches up reconnects
+        #    or first-load).
+        for ev in conv.events.replay(from_seq):
+            yield _format_sse(ev.seq, ev.type, ev.payload)
+        # 2) Subscribe to live events.
+        q = conv.events.subscribe()
         try:
-            async for evt in runner(conv, prompt, user_att, mode):
-                yield f"data: {json.dumps(evt)}\n\n".encode()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            log(f"conversation stream failed: {e}\n{traceback.format_exc()}")
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n".encode()
-            yield f"data: {json.dumps({'type': 'done'})}\n\n".encode()
+            while True:
+                if await request.is_disconnected():
+                    return
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield b": keep-alive\n\n"
+                    continue
+                yield _format_sse(ev.seq, ev.type, ev.payload)
+        finally:
+            conv.events.unsubscribe(q)
 
-    log(f"conv {cid} new msg (orchestrator={'agentic' if use_agentic else 'native'}, attach={user_att['kind'] if user_att else None})")
-    return StreamingResponse(stream(), media_type="text/event-stream")
-
-
-@app.get("/api/uploads/{name}")
-async def serve_upload(name: str) -> FileResponse:
-    """Serve a user-uploaded file (also used to render user-attached images
-    in the chat history)."""
-    path = UPLOADS_DIR / name
-    if not path.exists():
-        raise HTTPException(404, "upload not found")
-    mt, _ = mimetypes.guess_type(name)
-    return FileResponse(path, media_type=mt or "application/octet-stream")
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",       # disable nginx buffering if behind one
+    })
 
 
-# ---------- Optional startup warmup -----------------------------------------
+def _format_sse(seq: int, type: str, payload: Dict[str, Any]) -> bytes:
+    body = {"seq": seq, "type": type, "payload": payload}
+    return f"data: {json.dumps(body, default=str)}\n\n".encode()
+
+
+# ---------- Conversation-scoped jobs / assets endpoints ----------------------
+
+@app.get("/api/conversations/{cid}/jobs")
+async def list_conversation_jobs(cid: str, status: str = "all", limit: int = 50) -> Dict[str, Any]:
+    conv = state.conversations.get(cid)
+    if conv is None:
+        raise HTTPException(404, "conversation not found")
+    items = list(conv.jobs.values())
+    items.sort(key=lambda j: j.created_at, reverse=True)
+    if status != "all":
+        items = [j for j in items if j.status == status]
+    return {"count": len(items), "jobs": [j.public_dict() for j in items[:limit]]}
+
+
+@app.post("/api/conversations/{cid}/jobs/{job_id}/cancel")
+async def cancel_conversation_job(cid: str, job_id: str) -> Dict[str, Any]:
+    conv = state.conversations.get(cid)
+    if conv is None:
+        raise HTTPException(404, "conversation not found")
+    ok = state.runner.cancel(job_id, conversation_id=cid)
+    return {"cancelled": ok, "job_id": job_id}
+
+
+@app.get("/api/conversations/{cid}/assets")
+async def list_conversation_assets(cid: str, kind: str = "all", limit: int = 50) -> Dict[str, Any]:
+    conv = state.conversations.get(cid)
+    if conv is None:
+        raise HTTPException(404, "conversation not found")
+    items = list(conv.assets)
+    items.sort(key=lambda a: a.created_at, reverse=True)
+    if kind != "all":
+        items = [a for a in items if a.kind == kind]
+    return {"count": len(items), "assets": [a.public_dict() for a in items[:limit]]}
+
+
+# ---------- Startup ---------------------------------------------------------
 
 @app.on_event("startup")
 async def warmup() -> None:
+    # Bind the runner's event-loop reference and start its worker thread.
+    state.runner.start()
     log("startup: deferring Lance model load until first request")
-    # Probe the orchestrator once at startup (non-fatal if unreachable).
     state.orch_probe = await state.orch_client.probe()
     if state.orch_probe.get("reachable"):
         log(f"orchestrator OK: {state.orch_settings.base_url} model={state.orch_probe.get('model')!r}")

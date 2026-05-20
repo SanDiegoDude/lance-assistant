@@ -95,21 +95,36 @@ class Settings:
 
 SYSTEM_PROMPT = """You are Lance Assistant, a helpful multimodal AI. The user is talking to you through a chat UI that lets them ask questions, request images and videos, and edit media.
 
-You have access to ByteDance Lance, a unified multimodal model. You yourself handle conversation, reasoning, and visual understanding (you can already see any images the user attaches). When the user asks for new pixels — a new image, a new video, an edit to an existing one — you call one of the tools below. Otherwise just answer directly.
+You have access to ByteDance Lance, a unified multimodal model. You yourself handle conversation, reasoning, and visual understanding (you can already see any images the user attaches). When the user asks for new pixels — a new image, a new video, an edit to an existing one — you call one of the generation tools below. Otherwise just answer directly.
 
-Tools you can call:
+# Generation tools (async — they queue a background job)
 
-- `generate_image(prompt, aspect)` — make a brand-new image from a text prompt. Use when the user asks to "draw", "create", "make", "generate", "render", "paint", "show me" an image / picture / photo / illustration.
-- `generate_video(prompt, resolution, num_frames)` — make a short video clip. Use sparingly: video gen is SLOW (3 minutes at 192p, up to 26 minutes at 480p). If the user just says "make a video" without specifying quality, default to 192p and 49 frames; warn them in your text response that higher quality takes longer.
-- `edit_image(instruction)` — apply an edit ("make it night-time", "add a hat", "change the hair color") to the most recently shown image in this conversation. Identity is preserved across the edit. Only available when there is at least one image in the chat history.
-- `edit_video(instruction)` — same idea for the most recently shown video. Also slow (~26 min for 480p).
+- `generate_image(prompt, aspect)` — make a brand-new image from a text prompt. Use when the user asks to "draw", "create", "make", "generate", "render", "paint", "show me" an image / picture / photo / illustration. ~2 min.
+- `generate_video(prompt, resolution, num_frames)` — make a short video clip. SLOW: ~3 min at 192p, ~8 min at 360p, ~26 min at 480p. If the user just says "make a video", default to 192p and 49 frames and warn that higher quality takes longer.
+- `edit_image(instruction, asset_id?)` — apply an edit ("make it night-time", "add a hat", "change the hair color"). Targets the most recent image by default; pass `asset_id` to edit a specific older one. Identity is preserved through the edit. ~1 min.
+- `edit_video(instruction, asset_id?)` — same idea for video. Also slow.
 
-Rules:
+# State-query tools (instant)
 
-- Be a normal helpful assistant for everything that isn't a media generation request. Answer questions, reason, code, explain — directly, without tools.
+- `list_jobs(status?)` — list jobs in this conversation. Status filter: "running", "queued", "done", "failed", "all" (default "all").
+- `get_job(job_id)` — get full status of one job including its result asset.
+- `list_assets(kind?, limit?)` — list images/videos in this conversation, newest first. `kind`: "image", "video", "all" (default "all").
+- `get_asset(asset_id)` — get one asset's details.
+- `cancel_job(job_id)` — request cancellation of a queued or running job. (Running jobs can't actually be preempted; this is mostly useful for queued ones.)
+
+# How async generation works (IMPORTANT)
+
+When you call a generation tool, you get back `{job_id, status: "queued"}` almost instantly — NOT the finished image. Lance runs the job in the background while the user continues chatting. The image/video appears in the chat UI automatically when ready; you do not have to wait for it.
+
+After issuing the call, respond with a brief friendly acknowledgement ("Sure — kicking that off, it should be ready in about 2 minutes. While we wait, …") and then continue the conversation. Do not pretend the result is already there. Do not keep calling the same tool over and over.
+
+On a later turn, if the user asks "is it ready?" or "what did you make?", call `list_jobs(status="done")` or `list_jobs(status="running")` to check. You can also see the result in your conversation history once the job completes — the tool message that originally said `{status: queued}` gets back-filled to the final result automatically.
+
+# General behavior
+
+- Be a normal helpful assistant for everything that isn't a media request. Answer questions, reason, code, explain — directly, without tools.
 - When the user attaches media and asks about it, describe / analyze it yourself. You don't need a tool for that.
-- When you DO call a tool, the system will execute it and show the result in the chat. Then you'll get a follow-up message containing what was produced. Respond with a brief, friendly confirmation ("Here's the image of …", "Done — what do you think?"). Don't repeat the whole prompt.
-- Never invent images / videos in your text response. Either use a tool to produce them or don't claim they exist.
+- Never invent images / videos in your text response. Either trigger a generation tool or don't claim they exist.
 - Prefer concise responses with proper markdown. Use code fences (```language) for any code."""
 
 
@@ -169,9 +184,9 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
     ),
     _tool(
         "edit_image",
-        "Apply an edit instruction to the most recent image shown in this conversation. "
+        "Apply an edit instruction to an image in this conversation. "
         "Lance's image-edit model preserves identity (faces, objects, scene structure) while applying the requested change. "
-        "Use when the user wants to modify, change, alter, or edit a picture. Takes about 1 minute.",
+        "Use when the user wants to modify, change, alter, or edit a picture. Async — returns a job_id; the result appears in chat in ~1 min.",
         {
             "type": "object",
             "properties": {
@@ -179,20 +194,90 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
                     "type": "string",
                     "description": "What to change about the image. Examples: 'make it night-time with stars', 'change the hair color to dark green', 'add a wizard hat', 'make it black and white'.",
                 },
+                "asset_id": {
+                    "type": "string",
+                    "description": "ID of the asset to edit. If omitted, uses the most recent image in the conversation. Call list_assets to discover IDs.",
+                },
             },
             "required": ["instruction"],
         },
     ),
     _tool(
         "edit_video",
-        "Apply an edit instruction to the most recent video shown in this conversation. "
-        "SLOW (~26 min for 480p). Confirm with the user first.",
+        "Apply an edit instruction to a video in this conversation. "
+        "SLOW (~26 min for 480p). Confirm with the user first. Async — returns a job_id immediately.",
         {
             "type": "object",
             "properties": {
                 "instruction": {"type": "string", "description": "What to change about the video."},
+                "asset_id": {
+                    "type": "string",
+                    "description": "ID of the video asset to edit. If omitted, uses the most recent video.",
+                },
             },
             "required": ["instruction"],
+        },
+    ),
+    _tool(
+        "list_jobs",
+        "List the background generation jobs in this conversation, newest first. "
+        "Use to check whether a previously issued generation has finished, or to inspect the queue.",
+        {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["all", "queued", "running", "done", "failed", "cancelled", "active"],
+                    "default": "all",
+                    "description": "Filter by status. 'active' = queued + running.",
+                },
+                "limit": {"type": "integer", "default": 20},
+            },
+        },
+    ),
+    _tool(
+        "get_job",
+        "Get full details of one background job, including its result and asset_id when done.",
+        {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "The job ID returned by a previous generation tool call."},
+            },
+            "required": ["job_id"],
+        },
+    ),
+    _tool(
+        "list_assets",
+        "List image / video assets that exist in this conversation, newest first. "
+        "Use this to recall a specific older image so you can reference it in `edit_image(asset_id=...)`.",
+        {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["all", "image", "video"], "default": "all"},
+                "limit": {"type": "integer", "default": 20},
+            },
+        },
+    ),
+    _tool(
+        "get_asset",
+        "Get details of one asset including its caption / source / URL.",
+        {
+            "type": "object",
+            "properties": {
+                "asset_id": {"type": "string", "description": "The asset ID."},
+            },
+            "required": ["asset_id"],
+        },
+    ),
+    _tool(
+        "cancel_job",
+        "Request cancellation of a job. Only effective for jobs in 'queued' status; running jobs cannot be preempted but the call still records the intent.",
+        {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string"},
+            },
+            "required": ["job_id"],
         },
     ),
 ]

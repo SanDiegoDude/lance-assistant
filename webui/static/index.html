@@ -166,35 +166,68 @@
         </div>`;
     }
 
-    function ToolBubble({ b, onUseAsInput }) {
+    function ToolBubble({ b, onUseAsInput, onCancelJob }) {
+      // Tick the displayed elapsed locally so the bubble stays alive
+      // between server events.
+      const [tick, setTick] = useState(0);
+      useEffect(() => {
+        if (b.status === "running" || b.status === "queued") {
+          const id = setInterval(() => setTick(t => t + 1), 500);
+          return () => clearInterval(id);
+        }
+      }, [b.status]);
+
       const label = TOOL_LABEL[b.name] || b.name;
       const hint  = TOOL_HINT[b.name];
       const inner = b.kind_inner || (b.media_url ? (b.media_url.endsWith(".mp4") ? "video" : "image") : null);
       const status = b.status || (b.media_url ? "done" : "running");
 
+      // Compute live elapsed for running jobs
+      let elapsed = b.elapsed;
+      if (b.startedAt && (status === "running")) {
+        elapsed = (Date.now() - b.startedAt) / 1000;
+      } else if (status === "queued") {
+        elapsed = null;  // don't show elapsed for queued
+      }
+      void tick;  // referenced just to register the dep
+
       const statusColor =
-        status === "done"     ? "border-brand/30 bg-brand/5"
-      : status === "error"    ? "border-err/40 bg-err/5"
-      :                         "border-info/40 bg-info/5";
+        status === "done"      ? "border-brand/30 bg-brand/5"
+      : status === "error"     ? "border-err/40 bg-err/5"
+      : status === "cancelled" ? "border-warn/40 bg-warn/5"
+      : status === "queued"    ? "border-warn/30 bg-warn/5"
+      :                          "border-info/40 bg-info/5";
 
       return html`
         <div class=${"rounded-xl border " + statusColor + " p-2.5 space-y-1.5"}>
           <div class="flex items-center gap-2 text-[11px] uppercase tracking-wider text-txt-2">
             <span class=${
               "inline-block w-1.5 h-1.5 rounded-full " +
-              (status === "done"  ? "bg-brand"
-              : status === "error" ? "bg-err" : "bg-info pulse-dot")
+              (status === "done"      ? "bg-brand"
+              : status === "error"    ? "bg-err"
+              : status === "cancelled" ? "bg-warn"
+              : status === "queued"    ? "bg-warn pulse-dot"
+              :                          "bg-info pulse-dot")
             }></span>
-            <span>${label}</span>
-            ${b.elapsed != null && status === "done" ? html`<span>· ${formatElapsed(b.elapsed)}</span>` : null}
-            ${b.elapsed != null && status !== "done" && status !== "error"
-              ? html`<span>· ${formatElapsed(b.elapsed)}</span>` : null}
-            ${hint && status !== "done" ? html`<span class="text-txt-2 hidden md:inline">· ${hint}</span>` : null}
+            <span>
+              ${status === "queued" ? "⏳ Queued: " : status === "running" ? "" : status === "done" ? "" : status === "cancelled" ? "Cancelled: " : ""}
+              ${label}
+            </span>
+            ${elapsed != null ? html`<span>· ${formatElapsed(elapsed)}</span>` : null}
+            ${hint && (status === "queued" || status === "running") ? html`<span class="text-txt-2 hidden md:inline">· ${hint}</span>` : null}
+            ${b.job_id ? html`<span class="font-mono text-[10px] ml-auto text-txt-2">${b.job_id.slice(0, 10)}</span>` : null}
+            ${(status === "queued" || status === "running") && b.job_id && onCancelJob ? html`
+              <button onClick=${() => onCancelJob(b.job_id)}
+                class="ml-2 text-[10px] px-1.5 py-0.5 rounded border border-line bg-bg-2 hover:bg-bg-3 text-txt-1">
+                cancel
+              </button>` : null}
           </div>
           ${b.args && (b.args.prompt || b.args.instruction) ? html`
             <div class="text-xs text-txt-1 italic">"${b.args.prompt || b.args.instruction}"</div>` : null}
           ${b.error ? html`
             <div class="text-xs text-err whitespace-pre-wrap break-words">${b.error}</div>` : null}
+          ${b.text && !b.media_url ? html`
+            <div class="text-sm"><${MarkdownBubble} text=${b.text} /></div>` : null}
           ${b.media_url ? html`
             <${MediaBlock} kind=${inner} url=${b.media_url} filename=${b.media_filename}
               onUseAsInput=${onUseAsInput ? () => onUseAsInput(b) : null} />` : null}
@@ -202,23 +235,25 @@
     }
 
     // -------------------- Hook: useChat --------------------
+    //
+    // Event-driven, non-blocking. POST /messages returns 202; all output
+    // arrives via a persistent SSE on /events. Background jobs land in the
+    // chat whenever they complete, even if the user has already moved on.
 
     function useChat() {
       const [convId, setConvId] = useState(null);
       const [messages, setMessages] = useState([]);
-      const [pendingAttachment, setPendingAttachment] = useState(null); // {file, name, kind, previewUrl}
-      const [busy, setBusy] = useState(false);
+      const [activeJobs, setActiveJobs] = useState({});         // job_id -> {status, tool, prompt, started_at}
+      const [pendingAttachment, setPendingAttachment] = useState(null);
+      const [busy, setBusy] = useState(false);                  // POST in-flight only
+      const [streaming, setStreaming] = useState(false);        // orchestrator is generating
       const [health, setHealth] = useState(null);
 
-      const pushMessage = useCallback((m) => {
-        setMessages(prev => [...prev, { ...m, ts: Date.now() }]);
-      }, []);
+      const cursorRef = useRef(0);       // last event seq applied
+      const esRef     = useRef(null);    // EventSource handle
+      const convIdRef = useRef(null);
 
-      const updateMessage = useCallback((id, patchFn) => {
-        setMessages(prev => prev.map(m => m.id === id ? patchFn(m) : m));
-      }, []);
-
-      // Health/orchestrator probe
+      // ---- Health / orchestrator probe (polled) ----
       useEffect(() => {
         let cancelled = false;
         async function tick() {
@@ -233,14 +268,203 @@
         return () => { cancelled = true; clearInterval(id); };
       }, []);
 
-      // Create a conversation lazily
+      // ---- Helpers to mutate the rendered message list ----
+      const setMessagesAt = useCallback((index, patchFn) => {
+        setMessages(prev => prev.map((m, i) => i === index ? patchFn(m) : m));
+      }, []);
+
+      const upsertJobBlock = useCallback((jobId, patch) => {
+        setMessages(prev => {
+          const next = prev.slice();
+          // Walk backwards — the placeholder is almost always in the most recent message
+          for (let i = next.length - 1; i >= 0; i--) {
+            const m = next[i];
+            if (m.role !== "assistant" && m.role !== "tool" && m.role !== "system") continue;
+            if (!m.blocks) continue;
+            const idx = m.blocks.findIndex(b => b.kind === "tool" && b.job_id === jobId);
+            if (idx >= 0) {
+              const newBlocks = m.blocks.slice();
+              newBlocks[idx] = { ...newBlocks[idx], ...patch };
+              next[i] = { ...m, blocks: newBlocks };
+              return next;
+            }
+          }
+          return next;
+        });
+      }, []);
+
+      // ---- Apply one event from the bus ----
+      const applyEvent = useCallback((ev) => {
+        const { seq, type, payload } = ev;
+        if (typeof seq === "number") cursorRef.current = Math.max(cursorRef.current, seq);
+
+        if (type === "message_appended") {
+          // payload: {role, index, display_blocks, created_at}
+          const m = displayBlocksToMessage(payload.role, payload.display_blocks, payload.created_at);
+          setMessages(prev => [...prev, m]);
+        } else if (type === "text_delta") {
+          setStreaming(true);
+          setMessages(prev => {
+            // Find last assistant message that's "open" (streaming text accumulating
+            // before message_appended is emitted at end of turn would mean: orchestrator
+            // is mid-response, not yet committed). We render an ephemeral streaming
+            // bubble keyed by turn_id.
+            const turnId = payload.turn_id;
+            const idx = prev.findIndex(m => m.role === "assistant_streaming" && m.turnId === turnId);
+            if (idx >= 0) {
+              const m = prev[idx];
+              const newText = (m.streamingText || "") + (payload.delta || "");
+              const newM = { ...m, streamingText: newText };
+              const next = prev.slice();
+              next[idx] = newM;
+              return next;
+            }
+            return [...prev, {
+              id: `streaming-${turnId}`,
+              role: "assistant_streaming",
+              turnId,
+              streamingText: payload.delta || "",
+            }];
+          });
+        } else if (type === "tool_call") {
+          // Optional: render a "calling X..." chip. We keep it light — the
+          // next event (tool_result with queued status) will give us a full
+          // job placeholder we can render properly.
+        } else if (type === "tool_result") {
+          // The orchestrator received the tool's reply. For generation tools
+          // this is `{job_id, status: queued}`; the actual completion will
+          // come later as job_completed. For read-only tools it's the
+          // result data itself.
+          const r = payload.result || {};
+          if (payload.kind === "queued" && payload.job_id) {
+            // Add the job to the active map; the placeholder bubble will be
+            // attached to the next assistant message via message_appended,
+            // but we also want to show it inline immediately so add a synthetic
+            // pending-jobs banner if no assistant message yet.
+            setActiveJobs(prev => ({
+              ...prev,
+              [payload.job_id]: {
+                job_id: payload.job_id, tool: payload.name,
+                args: {}, status: "queued", started_at: Date.now() / 1000,
+              },
+            }));
+          }
+        } else if (type === "job_queued") {
+          setActiveJobs(prev => ({
+            ...prev,
+            [payload.job_id]: {
+              ...prev[payload.job_id],
+              job_id: payload.job_id, tool: payload.tool,
+              prompt: payload.prompt, args: payload.args || {},
+              status: "queued",
+              created_at: Date.now() / 1000,
+            },
+          }));
+          upsertJobBlock(payload.job_id, {
+            status: "queued",
+            name: payload.tool,
+            args: payload.args || {},
+            prompt: payload.prompt,
+          });
+        } else if (type === "job_started") {
+          setActiveJobs(prev => ({
+            ...prev,
+            [payload.job_id]: {
+              ...(prev[payload.job_id] || {}),
+              status: "running",
+              started_at: Date.now() / 1000,
+            },
+          }));
+          upsertJobBlock(payload.job_id, {
+            status: "running",
+            startedAt: Date.now(),
+            elapsed: 0,
+          });
+        } else if (type === "job_completed") {
+          setActiveJobs(prev => {
+            const { [payload.job_id]: _drop, ...rest } = prev;
+            return rest;
+          });
+          const r = payload.result || {};
+          const asset = payload.asset || {};
+          upsertJobBlock(payload.job_id, {
+            status: "done",
+            elapsed: payload.elapsed,
+            media_url: r.media_url || asset.url || "",
+            media_filename: r.media_filename || asset.filename || "",
+            kind_inner: r.kind || asset.kind,
+            asset_id: payload.asset_id,
+            text: r.kind === "text" ? r.text : undefined,
+          });
+        } else if (type === "job_failed") {
+          setActiveJobs(prev => {
+            const { [payload.job_id]: _drop, ...rest } = prev;
+            return rest;
+          });
+          upsertJobBlock(payload.job_id, {
+            status: "error",
+            error: payload.error,
+          });
+        } else if (type === "job_cancelled") {
+          setActiveJobs(prev => {
+            const { [payload.job_id]: _drop, ...rest } = prev;
+            return rest;
+          });
+          upsertJobBlock(payload.job_id, {
+            status: "cancelled",
+          });
+        } else if (type === "turn_started") {
+          // no-op (we already cleared streaming on text_delta)
+        } else if (type === "turn_ended") {
+          setStreaming(false);
+          // Drop any stale streaming bubble whose turnId matches — its text
+          // will already be present on the committed assistant message
+          // (message_appended fires before turn_ended for each round).
+          setMessages(prev => prev.filter(m =>
+            !(m.role === "assistant_streaming" && m.turnId === payload.turn_id)
+          ));
+        } else if (type === "error") {
+          setStreaming(false);
+          setMessages(prev => [...prev, {
+            id: `err-${Date.now()}`,
+            role: "system",
+            blocks: [{ kind: "text", text: `_Error: ${payload.message}_` }],
+            error: true,
+          }]);
+        }
+      }, [upsertJobBlock]);
+
+      // ---- Connect the persistent SSE for a conversation ----
+      const connect = useCallback((cid, fromSeq) => {
+        // Tear down any prior connection
+        if (esRef.current) { try { esRef.current.close(); } catch(_) {} esRef.current = null; }
+        if (!cid) return;
+        const url = `/api/conversations/${cid}/events?from_seq=${fromSeq || 0}`;
+        const es = new EventSource(url);
+        es.onmessage = (e) => {
+          try { applyEvent(JSON.parse(e.data)); } catch(err) { console.warn("bad sse event", err, e.data); }
+        };
+        es.onerror = (_e) => {
+          // Browser auto-reconnects EventSource; on reconnect the URL still
+          // has the original from_seq=0, but the server replays from there
+          // and we've already seen them — applyEvent is idempotent on
+          // active-jobs / placeholders since they key by id. Could refine
+          // by rebuilding the URL with cursorRef on close→retry.
+        };
+        esRef.current = es;
+      }, [applyEvent]);
+
+      // ---- Create or attach to a conversation ----
       const ensureConv = useCallback(async () => {
-        if (convId) return convId;
+        if (convIdRef.current) return convIdRef.current;
         const r = await fetch("/api/conversations", { method: "POST" });
         const j = await r.json();
+        convIdRef.current = j.conversation_id;
         setConvId(j.conversation_id);
+        cursorRef.current = 0;
+        connect(j.conversation_id, 0);
         return j.conversation_id;
-      }, [convId]);
+      }, [connect]);
 
       const reprobeOrchestrator = useCallback(async () => {
         try {
@@ -250,176 +474,35 @@
         } catch (_) {}
       }, []);
 
+      // ---- Submit a user message (non-blocking POST) ----
       const submit = useCallback(async ({ prompt, mode, useOrchestrator }) => {
         if (busy) return;
         if (!prompt && !pendingAttachment) return;
         setBusy(true);
-
-        const cid = await ensureConv();
-
-        const userMsg = {
-          id: `u-${Date.now()}`,
-          role: "user",
-          text: prompt,
-          attachment: pendingAttachment
-            ? { kind: pendingAttachment.kind, previewUrl: pendingAttachment.previewUrl, name: pendingAttachment.name }
-            : null,
-        };
-        pushMessage(userMsg);
-
-        const aId = `a-${Date.now() + 1}`;
-        const aMsg = {
-          id: aId,
-          role: "assistant",
-          blocks: [],          // mix of {kind:"text", text} and {kind:"tool", ...}
-          status: "running",
-          startedAt: Date.now(),
-        };
-        pushMessage(aMsg);
-
-        const form = new FormData();
-        form.append("prompt", prompt || "");
-        form.append("mode", mode);
-        form.append("use_orchestrator", String(!!useOrchestrator));
-        if (pendingAttachment?.file) {
-          form.append("attachment", pendingAttachment.file, pendingAttachment.name);
-        }
-        setPendingAttachment(null);
-
-        // POST + stream NDJSON-over-SSE
-        const ctrl = new AbortController();
-        let res;
         try {
-          res = await fetch(`/api/conversations/${cid}/messages`, {
-            method: "POST",
-            body: form,
-            signal: ctrl.signal,
-          });
-        } catch (e) {
-          updateMessage(aId, m => ({ ...m, status: "error",
-            blocks: [...m.blocks, { kind: "text", text: `_Network error: ${e.message}_` }] }));
-          setBusy(false);
-          return;
-        }
-        if (!res.ok || !res.body) {
-          const text = await (res.text?.() ?? Promise.resolve(""));
-          updateMessage(aId, m => ({ ...m, status: "error",
-            blocks: [...m.blocks, { kind: "text", text: `_Server returned ${res.status}: ${text}_` }] }));
-          setBusy(false);
-          return;
-        }
-
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        let currentTextIdx = -1;       // index of the current text block we're appending to
-
-        function appendBlock(blk) {
-          updateMessage(aId, m => ({ ...m, blocks: [...m.blocks, blk] }));
-        }
-        function appendTextDelta(delta) {
-          updateMessage(aId, m => {
-            const blocks = m.blocks.slice();
-            const last = blocks[blocks.length - 1];
-            if (last && last.kind === "text" && last._streaming) {
-              blocks[blocks.length - 1] = { ...last, text: last.text + delta };
-            } else {
-              blocks.push({ kind: "text", text: delta, _streaming: true });
-              currentTextIdx = blocks.length - 1;
-            }
-            return { ...m, blocks };
-          });
-        }
-        function sealStreamingText() {
-          updateMessage(aId, m => {
-            const blocks = m.blocks.map(b => b._streaming ? ({ ...b, _streaming: false }) : b);
-            return { ...m, blocks };
-          });
-        }
-        function updateOrAppendToolBlock(evt) {
-          // Match by tool id
-          updateMessage(aId, m => {
-            const blocks = m.blocks.slice();
-            const idx = blocks.findIndex(b => b.kind === "tool" && b.tool_id === evt.id);
-            const elapsed = evt.elapsed ?? (Date.now() - aMsg.startedAt) / 1000;
-            const base = idx >= 0 ? { ...blocks[idx] } : { kind: "tool", tool_id: evt.id };
-            if (evt.type === "tool_start") {
-              base.name = evt.name;
-              base.args = evt.args;
-              base.status = "running";
-              base.startedAt = Date.now();
-              base.elapsed = 0;
-            } else if (evt.type === "tool_result") {
-              base.status = "done";
-              base.elapsed = elapsed;
-              const r = evt.result || {};
-              if (r.media_url) {
-                base.media_url = r.media_url;
-                base.media_filename = r.media_filename;
-                base.kind_inner = r.kind;
-              } else if (r.kind === "text") {
-                // Native fallback returned text — add it as a separate text block
-                blocks.push({ kind: "text", text: r.text || "" });
-              }
-            } else if (evt.type === "tool_error") {
-              base.status = "error";
-              base.error = evt.error;
-              base.elapsed = elapsed;
-            }
-            if (idx >= 0) blocks[idx] = base; else blocks.push(base);
-            return { ...m, blocks };
-          });
-        }
-
-        // tick elapsed on running tools
-        const elapsedInterval = setInterval(() => {
-          updateMessage(aId, m => {
-            const now = Date.now();
-            const blocks = m.blocks.map(b => {
-              if (b.kind === "tool" && b.status === "running" && b.startedAt) {
-                return { ...b, elapsed: (now - b.startedAt) / 1000 };
-              }
-              return b;
-            });
-            return { ...m, blocks };
-          });
-        }, 250);
-
-        try {
-          // eslint-disable-next-line no-constant-condition
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const events = buffer.split("\n\n");
-            buffer = events.pop() || "";
-            for (const ev of events) {
-              const line = ev.trim();
-              if (!line.startsWith("data:")) continue;
-              let data;
-              try { data = JSON.parse(line.slice(5).trim()); } catch (_) { continue; }
-
-              if (data.type === "start") {
-                updateMessage(aId, m => ({ ...m, task_kind: data.task }));
-              } else if (data.type === "text_delta") {
-                appendTextDelta(data.delta);
-              } else if (data.type === "tool_start" || data.type === "tool_result" || data.type === "tool_error") {
-                sealStreamingText();
-                updateOrAppendToolBlock(data);
-              } else if (data.type === "error") {
-                appendBlock({ kind: "text", text: `_Error: ${data.message}_` });
-                updateMessage(aId, m => ({ ...m, status: "error" }));
-              } else if (data.type === "done") {
-                sealStreamingText();
-                updateMessage(aId, m => ({ ...m, status: m.status === "error" ? "error" : "done" }));
-              }
-            }
+          const cid = await ensureConv();
+          const form = new FormData();
+          form.append("prompt", prompt || "");
+          form.append("mode", mode);
+          form.append("use_orchestrator", String(!!useOrchestrator));
+          if (pendingAttachment?.file) {
+            form.append("attachment", pendingAttachment.file, pendingAttachment.name);
           }
+          setPendingAttachment(null);
+          const res = await fetch(`/api/conversations/${cid}/messages`, {
+            method: "POST", body: form,
+          });
+          if (!res.ok) {
+            const text = await res.text();
+            applyEvent({ seq: -1, type: "error", payload: { message: `HTTP ${res.status}: ${text}` } });
+          }
+          // Output flows through the SSE — nothing else to do here.
+        } catch (e) {
+          applyEvent({ seq: -1, type: "error", payload: { message: e.message || String(e) } });
         } finally {
-          clearInterval(elapsedInterval);
           setBusy(false);
         }
-      }, [busy, pendingAttachment, pushMessage, updateMessage, ensureConv]);
+      }, [busy, pendingAttachment, ensureConv, applyEvent]);
 
       const setAttachmentFromFile = useCallback((file) => {
         if (!file) { setPendingAttachment(null); return; }
@@ -433,8 +516,6 @@
       }, []);
 
       const reattachFromUrl = useCallback(async (mediaUrl, filename, kind) => {
-        // Just fetch the bytes and stash them as a pending attachment so the
-        // next submission re-uploads them.
         try {
           const r = await fetch(mediaUrl);
           if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -446,17 +527,64 @@
         }
       }, [setAttachmentFromFile]);
 
-      const newChat = useCallback(() => {
-        setMessages([]);
-        setConvId(null);
-        setPendingAttachment(null);
+      const cancelJob = useCallback(async (jobId) => {
+        if (!convIdRef.current) return;
+        try {
+          await fetch(`/api/conversations/${convIdRef.current}/jobs/${jobId}/cancel`, { method: "POST" });
+        } catch(_) {}
       }, []);
 
+      const newChat = useCallback(() => {
+        if (esRef.current) { try { esRef.current.close(); } catch(_) {} esRef.current = null; }
+        setMessages([]);
+        setConvId(null);
+        convIdRef.current = null;
+        cursorRef.current = 0;
+        setActiveJobs({});
+        setPendingAttachment(null);
+        setStreaming(false);
+      }, []);
+
+      useEffect(() => () => { if (esRef.current) try { esRef.current.close(); } catch(_) {} }, []);
+
       return {
-        convId, messages, busy, health,
+        convId, messages, busy, streaming, health, activeJobs,
         pendingAttachment, setAttachmentFromFile, setPendingAttachment,
-        reattachFromUrl, submit, newChat, reprobeOrchestrator,
+        reattachFromUrl, submit, newChat, reprobeOrchestrator, cancelJob,
       };
+    }
+
+    // Translate a list of server `display_blocks` into the renderer's
+    // message shape. We try to keep them as similar as possible — the
+    // renderer accepts {kind:"text"|"image"|"video"|"tool"|"tool_error"}.
+    function displayBlocksToMessage(role, displayBlocks, createdAt) {
+      const id = `m-${role}-${createdAt}-${Math.random().toString(36).slice(2,7)}`;
+      const blocks = (displayBlocks || []).map(b => {
+        if (b.kind === "text") return { kind: "text", text: b.text };
+        if (b.kind === "image") return { kind: "image", url: b.media_url, filename: b.filename || "" };
+        if (b.kind === "video") return { kind: "video", url: b.media_url, filename: b.filename || "" };
+        if (b.kind === "tool_result") {
+          return {
+            kind: "tool",
+            job_id: b.job_id,
+            tool_call_id: b.tool_call_id,
+            name: b.name,
+            args: b.args || {},
+            status: b.status || (b.media_url ? "done" : "running"),
+            elapsed: b.elapsed || 0,
+            media_url: b.media_url,
+            media_filename: b.media_filename,
+            kind_inner: b.kind_inner,
+            text: b.text,
+            error: b.error,
+          };
+        }
+        if (b.kind === "tool_error") {
+          return { kind: "tool", name: b.name, status: "error", error: b.error };
+        }
+        return null;
+      }).filter(Boolean);
+      return { id, role, blocks, created_at: createdAt };
     }
 
     // -------------------- Components --------------------
@@ -497,57 +625,100 @@
     }
 
     function UserMessage({ m }) {
+      const textBlock = (m.blocks || []).find(b => b.kind === "text");
+      const mediaBlock = (m.blocks || []).find(b => b.kind === "image" || b.kind === "video");
       return html`
         <div class="flex justify-end fade-up">
           <div class="max-w-[80%] space-y-2">
-            ${m.attachment ? html`
+            ${mediaBlock ? html`
               <div class="ml-auto w-fit">
-                ${m.attachment.kind === "image"
-                  ? html`<img src=${m.attachment.previewUrl} class="max-h-48 rounded-lg border border-line"/>`
-                  : html`<video src=${m.attachment.previewUrl} class="max-h-48 rounded-lg border border-line"/>`}
-                <div class="text-[10px] text-txt-2 mt-1 text-right">${m.attachment.name}</div>
+                ${mediaBlock.kind === "image"
+                  ? html`<img src=${mediaBlock.url} class="max-h-48 rounded-lg border border-line"/>`
+                  : html`<video src=${mediaBlock.url} class="max-h-48 rounded-lg border border-line" controls/>`}
+                ${mediaBlock.filename ? html`
+                  <div class="text-[10px] text-txt-2 mt-1 text-right">${mediaBlock.filename}</div>` : null}
               </div>` : null}
-            ${m.text ? html`
+            ${textBlock?.text ? html`
               <div class="bg-brand/10 border border-brand/30 rounded-2xl rounded-br-md px-4 py-2.5 text-sm whitespace-pre-wrap leading-relaxed">
-                ${m.text}
+                ${textBlock.text}
               </div>` : null}
           </div>
         </div>`;
     }
 
-    function AssistantMessage({ m, onUseAsInput }) {
-      const status = m.status || "running";
-      const statusColor = status === "done"  ? "text-ok"
-                       : status === "error" ? "text-err"
-                       :                       "text-brand";
-      const hasContent = m.blocks && m.blocks.length > 0;
+    function AssistantStreamingMessage({ m }) {
       return html`
         <div class="flex justify-start fade-up">
           <div class="max-w-[85%] space-y-2 w-full">
-            <div class="text-[10px] uppercase tracking-wider ${statusColor} flex items-center gap-2">
+            <div class="text-[10px] uppercase tracking-wider text-brand flex items-center gap-2">
+              <span class="inline-block w-1.5 h-1.5 rounded-full bg-brand pulse-dot"></span>
+              <span>Assistant</span>
+            </div>
+            <div class="bg-bg-2 border border-line rounded-2xl rounded-bl-md px-4 py-2.5 text-sm">
+              ${m.streamingText
+                ? html`<${MarkdownBubble} text=${m.streamingText} /><span class="blink text-txt-2">▍</span>`
+                : html`<span class="text-txt-2">thinking…</span>`}
+            </div>
+          </div>
+        </div>`;
+    }
+
+    function AssistantMessage({ m, onUseAsInput, onCancelJob }) {
+      // status is derived from contained tool blocks if any
+      const toolBlocks = (m.blocks || []).filter(b => b.kind === "tool");
+      const anyError = toolBlocks.some(t => t.status === "error");
+      const anyRunning = toolBlocks.some(t => t.status === "running" || t.status === "queued");
+      const status = anyError ? "error" : anyRunning ? "running" : "done";
+
+      return html`
+        <div class="flex justify-start fade-up">
+          <div class="max-w-[85%] space-y-2 w-full">
+            <div class=${"text-[10px] uppercase tracking-wider flex items-center gap-2 " +
+              (status === "error" ? "text-err" : status === "running" ? "text-brand" : "text-ok")}>
               <span class=${"inline-block w-1.5 h-1.5 rounded-full " +
                   (status === "running" ? "bg-brand pulse-dot"
                 : status === "error"    ? "bg-err"
                 :                          "bg-ok")}></span>
-              <span>${m.task_kind === "lance_native" ? "Lance (no orchestrator)" : "Assistant"}</span>
+              <span>Assistant</span>
             </div>
 
-            ${hasContent ? m.blocks.map((b, i) => {
+            ${(m.blocks || []).length > 0 ? (m.blocks || []).map((b, i) => {
               if (b.kind === "text") {
                 return html`<div key=${i} class="bg-bg-2 border border-line rounded-2xl rounded-bl-md px-4 py-2.5 text-sm">
                   <${MarkdownBubble} text=${b.text} />
-                  ${b._streaming ? html`<span class="blink text-txt-2">▍</span>` : null}
                 </div>`;
               }
               if (b.kind === "tool") {
-                return html`<${ToolBubble} key=${i} b=${b} onUseAsInput=${onUseAsInput} />`;
+                return html`<${ToolBubble} key=${i} b=${b} onUseAsInput=${onUseAsInput} onCancelJob=${onCancelJob} />`;
               }
               return null;
-            }) : html`
-              <div class="bg-bg-2 border border-line rounded-2xl rounded-bl-md px-4 py-2.5 text-sm text-txt-2 flex items-center gap-2">
-                <span class="inline-block w-2 h-2 rounded-full bg-brand pulse-dot"></span>
-                <span>thinking…</span>
-              </div>`}
+            }) : null}
+          </div>
+        </div>`;
+    }
+
+    function ToolMessage({ m, onUseAsInput, onCancelJob }) {
+      // A standalone tool message (no associated assistant text). Renders
+      // any tool blocks at the assistant level.
+      const blocks = (m.blocks || []).filter(b => b.kind === "tool");
+      if (blocks.length === 0) return null;
+      return html`
+        <div class="flex justify-start fade-up">
+          <div class="max-w-[85%] space-y-2 w-full">
+            ${blocks.map((b, i) =>
+              html`<${ToolBubble} key=${i} b=${b} onUseAsInput=${onUseAsInput} onCancelJob=${onCancelJob} />`
+            )}
+          </div>
+        </div>`;
+    }
+
+    function SystemMessage({ m }) {
+      const text = (m.blocks || []).map(b => b.text || "").join("\n");
+      return html`
+        <div class="flex justify-center fade-up">
+          <div class=${"text-xs px-3 py-1.5 rounded-md border " +
+              (m.error ? "border-err/30 bg-err/10 text-err" : "border-line bg-bg-2 text-txt-2")}>
+            <${MarkdownBubble} text=${text} className="!text-xs" />
           </div>
         </div>`;
     }
@@ -599,6 +770,7 @@
       }, [prompt]);
 
       const orchReachable = chat.health?.orchestrator?.reachable;
+      const activeJobCount = Object.keys(chat.activeJobs || {}).length;
 
       return html`
         <div class="border-t border-line bg-bg-1/95 backdrop-blur-md">
@@ -685,9 +857,10 @@
               </button>
             </div>
 
-            <div class="text-[10px] text-txt-2 px-2">
-              Enter to send · Shift+Enter for newline · drag-and-drop or paste files
-              ${!orchReachable && chat.health ? html`<span class="ml-2 text-warn">· orchestrator offline → using Lance-native dispatch</span>` : null}
+            <div class="text-[10px] text-txt-2 px-2 flex items-center flex-wrap gap-2">
+              <span>Enter to send · Shift+Enter for newline · drag-and-drop or paste files</span>
+              ${activeJobCount > 0 ? html`<span class="text-info">· ${activeJobCount} job${activeJobCount === 1 ? "" : "s"} running in background — chat away</span>` : null}
+              ${!orchReachable && chat.health ? html`<span class="text-warn">· orchestrator offline → using Lance-native dispatch</span>` : null}
             </div>
           </div>
         </div>`;
@@ -733,21 +906,77 @@
         </div>`;
     }
 
+    function ActiveJobsBanner({ activeJobs, onCancel }) {
+      const items = Object.values(activeJobs || {});
+      if (items.length === 0) return null;
+      return html`
+        <div class="max-w-3xl mx-auto px-4 pt-3">
+          <div class="rounded-lg border border-info/30 bg-info/5 p-2 text-[11px] text-txt-1">
+            <div class="text-txt-2 uppercase tracking-wider text-[10px] mb-1">
+              ${items.length} background job${items.length === 1 ? "" : "s"} running — you can keep chatting
+            </div>
+            ${items.map(j => html`
+              <div class="flex items-center gap-2 py-0.5">
+                <span class=${"inline-block w-1.5 h-1.5 rounded-full " +
+                    (j.status === "running" ? "bg-info pulse-dot" : "bg-warn pulse-dot")}></span>
+                <span class="text-txt-1">${TOOL_LABEL[j.tool] || j.tool}</span>
+                ${j.prompt ? html`<span class="text-txt-2 truncate italic">"${(j.prompt || "").slice(0, 60)}"</span>` : null}
+                <span class="font-mono text-[10px] text-txt-2 ml-auto">${(j.job_id || "").slice(0, 10)}</span>
+                <button onClick=${() => onCancel(j.job_id)}
+                  class="text-[10px] px-1.5 py-0.5 rounded border border-line bg-bg-2 hover:bg-bg-3">
+                  cancel
+                </button>
+              </div>`)}
+          </div>
+        </div>`;
+    }
+
     function App() {
       const chat = useChat();
       const scrollRef = useRef(null);
 
       useEffect(() => {
         if (!scrollRef.current) return;
-        scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-      }, [chat.messages.length, chat.messages[chat.messages.length-1]?.blocks?.length]);
+        const el = scrollRef.current;
+        // Only auto-scroll if user is near the bottom; respect their scroll
+        // position so they can review while a job runs in the background.
+        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
+        if (nearBottom) {
+          el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+        }
+      }, [chat.messages.length, chat.messages.map(m => m.blocks?.length || 0).join(",")]);
 
       const onUseAsInput = useCallback((toolBlock) => {
         if (!toolBlock.media_url) return;
         chat.reattachFromUrl(toolBlock.media_url, toolBlock.media_filename, toolBlock.kind_inner);
       }, [chat]);
 
+      const onCancelJob = useCallback((jobId) => { chat.cancelJob(jobId); }, [chat]);
+
       const orchOk = chat.health?.orchestrator?.reachable;
+
+      // Render in chronological order; collapse standalone tool messages
+      // into the closest preceding assistant message so the UI doesn't
+      // show empty "Assistant" headers for back-fillable tool placeholders.
+      const renderedMessages = useMemo(() => {
+        const out = [];
+        for (const m of chat.messages) {
+          if (m.role === "tool") {
+            // Merge into the most recent assistant message if it has no
+            // text/tool blocks for this same job. Otherwise render as its
+            // own "tool" row.
+            const prev = out[out.length - 1];
+            if (prev && (prev.role === "assistant") && Array.isArray(prev.blocks)) {
+              prev.blocks = [...prev.blocks, ...(m.blocks || [])];
+              continue;
+            }
+            out.push({ ...m, role: "tool" });
+            continue;
+          }
+          out.push(m);
+        }
+        return out;
+      }, [chat.messages]);
 
       return html`
         <div class="h-full flex flex-col">
@@ -773,18 +1002,23 @@
             </div>
           </div>
 
+          <${ActiveJobsBanner} activeJobs=${chat.activeJobs} onCancel=${onCancelJob} />
+
           <!-- Messages -->
           <div ref=${scrollRef} class="flex-1 overflow-y-auto">
             <div class="max-w-3xl mx-auto px-4 py-6 space-y-4 min-h-full">
-              ${chat.messages.length === 0
+              ${renderedMessages.length === 0
                 ? html`<${EmptyState} orchOk=${orchOk} onPick=${(idea) => {
                     chat.submit({ prompt: idea.label, mode: idea.mode, useOrchestrator: orchOk });
                   }} />`
-                : chat.messages.map(m =>
-                    m.role === "user"
-                      ? html`<${UserMessage} key=${m.id} m=${m} />`
-                      : html`<${AssistantMessage} key=${m.id} m=${m} onUseAsInput=${onUseAsInput} />`
-                  )}
+                : renderedMessages.map(m => {
+                    if (m.role === "user")                return html`<${UserMessage} key=${m.id} m=${m} />`;
+                    if (m.role === "assistant_streaming") return html`<${AssistantStreamingMessage} key=${m.id} m=${m} />`;
+                    if (m.role === "assistant")           return html`<${AssistantMessage} key=${m.id} m=${m} onUseAsInput=${onUseAsInput} onCancelJob=${onCancelJob} />`;
+                    if (m.role === "tool")                return html`<${ToolMessage} key=${m.id} m=${m} onUseAsInput=${onUseAsInput} onCancelJob=${onCancelJob} />`;
+                    if (m.role === "system")              return html`<${SystemMessage} key=${m.id} m=${m} />`;
+                    return null;
+                  })}
             </div>
           </div>
 

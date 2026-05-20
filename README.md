@@ -42,16 +42,25 @@ reasoning, code-fenced markdown, and visual understanding; Lance is its
 tool for actually producing new pixels.
 
 The orchestrator chats with the user and emits OpenAI-style function
-calls when it needs new pixels. We then run Lance, hand the result back
-to the orchestrator so it can *see* what was produced, and let it
-respond with a confirmation. Tools exposed to the orchestrator:
+calls when it needs new pixels. Lance jobs run **asynchronously** in the
+background — the orchestrator gets back `{job_id, status: queued}` instantly,
+responds with a quick acknowledgement ("Sure, kicking that off — should be
+ready in ~2 min"), and the conversation continues. The image lands in the
+chat whenever Lance finishes; meanwhile the user can keep typing, ask
+follow-up questions, even start *another* job in parallel (they'll queue
+on the GPU).
 
-| Tool                              | What it runs                          |
-|---|---|
-| `generate_image(prompt, aspect)`  | Lance t2i (~2 min)                   |
-| `generate_video(prompt, ...)`     | Lance t2v (~3 min at 192p, ~26 min at 480p) |
-| `edit_image(instruction)`         | Lance image_edit on the most recent image (~1 min) |
-| `edit_video(instruction)`         | Lance video_edit on the most recent video (slow) |
+| Tool                                          | What it runs                                | When |
+|---|---|---|
+| `generate_image(prompt, aspect)`              | Lance t2i                                   | ~2 min |
+| `generate_video(prompt, resolution, frames)`  | Lance t2v                                   | 3 min @192p → 26 min @480p |
+| `edit_image(instruction, asset_id?)`          | Lance image_edit on `asset_id` or the most recent image | ~1 min |
+| `edit_video(instruction, asset_id?)`          | Lance video_edit on the most recent video   | slow |
+| `list_jobs(status?)`                          | inspect background generations              | instant |
+| `get_job(job_id)`                             | full status + result of one job             | instant |
+| `list_assets(kind?, limit?)`                  | every image/video tracked in this chat      | instant |
+| `get_asset(asset_id)`                         | one asset's caption / URL / source          | instant |
+| `cancel_job(job_id)`                          | request cancellation (effective for queued) | instant |
 
 Image and video **understanding** are handled by the orchestrator VLM
 itself — it can already see whatever you attach, no Lance call needed.
@@ -59,7 +68,19 @@ itself — it can already see whatever you attach, no Lance call needed.
 If the orchestrator is unreachable (LM Studio not running, etc.) the
 UI shows an "orchestrator: offline" pill and falls back to **Lance-native
 dispatch**: the Output: pills (Auto / Text / Image / Video / Understand)
-pick a task directly from your prompt and attachment.
+pick a task directly from your prompt and attachment. Lance-native mode
+also uses the async job queue, so the UX is consistent.
+
+### How the realtime UI stays alive across long jobs
+
+Each conversation has a **persistent SSE event channel** at
+`/api/conversations/{cid}/events` that the frontend keeps open for the
+session. All events (text deltas, tool calls, job lifecycle, errors)
+flow through that single channel with monotonic sequence numbers. On
+reconnect, the client can pass `?from_seq=N+1` to replay anything
+missed without dropping frames. POST `/messages` is non-blocking — it
+returns `202` immediately and the orchestrator turn runs in the
+background.
 
 **Recommended orchestrator models** (load one in LM Studio):
 
