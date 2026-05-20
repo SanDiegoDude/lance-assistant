@@ -431,8 +431,27 @@ class LancePipeline:
             training_args=inference_args,
         )
 
-        log(f"  move to GPU {self.device}")
-        model = model.to(self.device)
+        # Lance's official inference moves the model to GPU in fp32 first,
+        # then casts to bf16 after the checkpoint loads. That requires ~24 GB
+        # just for the LLM weights and blows past a 4090's 24 GB budget
+        # before we even reach the cast. Convert to bf16 BEFORE the move so
+        # we land at ~8 GB total (LLM 6 + ViT 1.4 + VAE 0.6) instead of ~16.
+        # The checkpoint on disk is bf16 already (see torch_dtype in
+        # llm_config.json), so we lose no precision; load_state_dict casts
+        # cross-dtype anyway. Override with LANCE_DTYPE=float16|float32 if
+        # you're on big-VRAM hardware and want different precision.
+        dtype_str = os.environ.get("LANCE_DTYPE", "bfloat16").lower()
+        load_dtype = {
+            "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+            "float16":  torch.float16,  "fp16": torch.float16,  "half": torch.float16,
+            "float32":  torch.float32,  "fp32": torch.float32,
+        }.get(dtype_str, torch.bfloat16)
+        log(f"  move to GPU {self.device} (dtype={dtype_str})")
+        try:
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        model = model.to(device=self.device, dtype=load_dtype)
 
         log("  load tokenizer + special tokens")
         tokenizer = Qwen2Tokenizer.from_pretrained(model_path)

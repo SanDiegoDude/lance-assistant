@@ -427,6 +427,25 @@ installing manually, here's what's going on:
    .venv/bin/pip install flash-attn==2.7.4.post1 --no-build-isolation
    ```
 
+### VRAM / precision
+
+By default the server loads Lance in **bf16** (~8 GB on a 24 GB card —
+LLM ~6 GB + ViT ~1.4 GB + VAE ~0.6 GB). The official ByteDance inference
+moves the model to GPU in fp32 first and only casts afterwards, which
+needs ~16 GB just for the move and OOMs a 4090. Our server collapses
+that into a single bf16 move.
+
+If you have an 80 GB card and want maximum precision:
+```bash
+export LANCE_DTYPE=float32   # or float16 / bfloat16 (default)
+```
+
+If you're still tight on memory (e.g. background processes already using
+the card), set the standard fragmentation hint:
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
 ## Fetching weights
 
 The web UI **auto-downloads** weights on first launch (`group=video`,
