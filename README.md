@@ -348,26 +348,84 @@ away.
 ## Setup
 
 For most users the `setup.sh` script at the top is all you need. It
-creates `.venv/`, installs deps from `pyproject.toml`, clones the official
-Lance code, and applies the `decord` soft-import patch.
+creates `.venv/`, installs the right torch + flash-attn for your GPU,
+clones the official Lance code, and applies the `decord` soft-import
+patch.
 
 ```bash
 ./scripts/setup.sh
 ```
 
-If you'd rather wire it into an existing env, set `SKIP_VENV=1` or
-`PYTHON=/path/to/python`. The `pyproject.toml` pins runtime minimums but
-**not** torch / CUDA — install those yourself if you need a specific build:
+The script auto-detects your GPU arch from `nvidia-smi` and picks the
+matching stack:
 
-- **Ampere (sm_86) / Ada (sm_89) / Hopper (sm_90):** `torch>=2.5 cu124+` works,
-  and `flash-attn>=2.6` will compile cleanly. The official pins
-  (torch 2.5.1+cu124 / transformers 4.49 / flash-attn 2.6.3) are a safe
-  starting point.
-- **Blackwell (sm_120 / sm_121, e.g. GB10 / DGX Spark):** you need
-  **torch 2.9 + cu128** and **flash-attn 2.8.3+**. The official cu124
-  pins will fail to compile PTX for `sm_121`. Our `webui/server.py`
-  monkey-patches `flex_attention` out of `torch.compile` and forces SDPA
-  on the ViT to dodge the remaining Triton compile holes on Blackwell.
+| GPU                                 | Compute cap | Stack `setup.sh` installs                   |
+|---|---|---|
+| 3090 / A100 / A40 (Ampere)          | sm_80 / sm_86 | torch 2.5.1+cu124 + flash-attn 2.7.4.post1 |
+| 4090 / L40 / RTX 6000 Ada (Ada)     | sm_89        | torch 2.5.1+cu124 + flash-attn 2.7.4.post1 |
+| H100 / H200 (Hopper)                | sm_90        | torch 2.5.1+cu124 + flash-attn 2.7.4.post1 |
+| GB10 / DGX Spark / 5090 (Blackwell) | sm_120 / sm_121 | torch 2.9.0+cu128 (no flash-attn — uses SDPA) |
+| CPU-only                            | —            | torch 2.5.1+cpu                              |
+
+Override via env var if auto-detection picks the wrong stack:
+
+```bash
+GPU_DEPS=cu124 ./scripts/setup.sh      # force Ampere/Ada/Hopper stack
+GPU_DEPS=cu121 ./scripts/setup.sh      # official Lance pin (torch 2.5.1+cu121 / flash-attn 2.6.3)
+GPU_DEPS=cu128 ./scripts/setup.sh      # Blackwell
+GPU_DEPS=cpu   ./scripts/setup.sh
+GPU_DEPS=skip  ./scripts/setup.sh      # bring your own torch / flash-attn
+FLASH_ATTN_SKIP=1 ./scripts/setup.sh   # install torch, skip flash-attn (SDPA-only)
+```
+
+If you'd rather wire it into an existing env, set `SKIP_VENV=1`. You can
+also point `PYTHON=/path/to/python` to a specific interpreter when
+creating the venv.
+
+### Troubleshooting `flash-attn`
+
+flash-attn is the #1 source of setup pain across every project that uses
+it. `setup.sh` handles the common case, but if it fails or you're
+installing manually, here's what's going on:
+
+1. **`ModuleNotFoundError: No module named 'torch'` during the build.**
+   This is pip's default *build isolation* creating a clean env without
+   torch, which flash-attn's `setup.py` imports. Always use:
+   ```bash
+   pip install flash-attn==... --no-build-isolation
+   ```
+
+2. **`pip` starts compiling instead of downloading a wheel.**
+   Compilation needs nvcc and takes 30+ min. Prebuilt wheels exist on
+   the [Dao-AILab releases page](https://github.com/Dao-AILab/flash-attention/releases)
+   for **specific** torch + cuda + python combos. If yours doesn't
+   match, pip falls back to source build. Fix by pinning torch to a
+   version with wheel coverage:
+   ```bash
+   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+   pip install flash-attn==2.7.4.post1 --no-build-isolation
+   ```
+
+3. **`packaging` / `ninja` not found.**
+   flash-attn's build script imports them. Always:
+   ```bash
+   pip install --upgrade pip wheel packaging ninja
+   ```
+   *before* installing flash-attn.
+
+4. **Blackwell (sm_120 / sm_121) won't build flash-attn.**
+   No prebuilt wheels exist yet and source builds frequently fail. The
+   server falls back to SDPA + a monkey-patched `flex_attention` and
+   runs fine without flash-attn — just install it with
+   `FLASH_ATTN_SKIP=1 ./scripts/setup.sh`.
+
+5. **Already installed wrong torch? Reinstall:**
+   ```bash
+   .venv/bin/pip uninstall -y torch torchvision torchaudio flash-attn
+   .venv/bin/pip install torch==2.5.1 torchvision torchaudio \
+       --index-url https://download.pytorch.org/whl/cu124
+   .venv/bin/pip install flash-attn==2.7.4.post1 --no-build-isolation
+   ```
 
 ## Fetching weights
 
