@@ -265,6 +265,38 @@ class LancePipeline:
         from modeling.lance import qwen2_navit as _qwen2_navit
         _qwen2_navit.flex_attention = _eager_flex_attention
 
+        # transformers 5.x dropped the "default" key from ROPE_INIT_FUNCTIONS
+        # (the "default" rope-init function is now invoked via the new
+        # RopeParameters machinery instead of a dict lookup). Lance's qwen2
+        # fork hardcodes ROPE_INIT_FUNCTIONS["default"] in both
+        # modeling/qwen2/modeling_qwen2.py and modeling/qwen2_5_vl/
+        # modeling_qwen2_5_vl.py, so on a 5.x install every generation route
+        # fails with KeyError: 'default'. Re-inject the original 4.x impl —
+        # this is verbatim from transformers v4.56.1 modeling_rope_utils.py.
+        try:
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+            if "default" not in ROPE_INIT_FUNCTIONS:
+                def _compute_default_rope_parameters(config=None, device=None, seq_len=None, **_):
+                    base = config.rope_theta
+                    partial_rotary_factor = (
+                        config.partial_rotary_factor
+                        if hasattr(config, "partial_rotary_factor") else 1.0
+                    )
+                    head_dim = getattr(config, "head_dim", None) or (
+                        config.hidden_size // config.num_attention_heads
+                    )
+                    dim = int(head_dim * partial_rotary_factor)
+                    inv_freq = 1.0 / (base ** (
+                        torch.arange(0, dim, 2, dtype=torch.int64)
+                             .to(device=device, dtype=torch.float) / dim
+                    ))
+                    return inv_freq, 1.0
+                ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
+                log("  patched ROPE_INIT_FUNCTIONS to restore the 'default' entry "
+                    "(transformers 5.x compatibility)")
+        except Exception as e:  # noqa: BLE001
+            log(f"  warning: could not patch ROPE_INIT_FUNCTIONS: {e}")
+
         from safetensors.torch import load_file
         from transformers import set_seed
         from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (

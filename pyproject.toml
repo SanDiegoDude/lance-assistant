@@ -13,7 +13,11 @@ dependencies = [
     # core ML
     "torch>=2.5",
     "safetensors>=0.4",
-    "transformers>=4.49",
+    # Lance's qwen2 fork was built against transformers 4.41.x and hard-codes
+    # ROPE_INIT_FUNCTIONS["default"] which was removed in 5.0. We monkey-patch
+    # it back at runtime in webui/server.py, so 5.x technically works, but the
+    # safe upper bound for fresh installs is <5.
+    "transformers>=4.49,<5",
     "huggingface_hub>=0.26",
     "accelerate>=0.30",
     # webui
