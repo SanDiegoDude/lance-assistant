@@ -1401,6 +1401,7 @@ async def run_agentic_turn(conv: Conversation) -> None:
             ad_blocks: List[Dict[str, Any]] = []
             if accumulated_text:
                 ad_blocks.append({"kind": "text", "text": accumulated_text})
+            is_final = not accumulated_tool_calls
             conv.append(ConvMessage(
                 role="assistant",
                 oai_message=assistant_msg,
@@ -1412,9 +1413,12 @@ async def run_agentic_turn(conv: Conversation) -> None:
                 "index": len(conv.messages) - 1,
                 "display_blocks": ad_blocks,
                 "created_at": conv.messages[-1].created_at,
+                "turn_id": turn_id,
+                "final": is_final,
+                "has_tool_calls": bool(accumulated_tool_calls),
             })
 
-            if not accumulated_tool_calls:
+            if is_final:
                 break
 
             # Process tool calls.
@@ -1422,6 +1426,7 @@ async def run_agentic_turn(conv: Conversation) -> None:
                 name = tc["name"]
                 args = tc.get("arguments") or {}
                 conv.events.emit("tool_call", {
+                    "turn_id": turn_id,
                     "tool_call_id": tc["id"],
                     "name": name,
                     "args": args,
@@ -1440,16 +1445,33 @@ async def run_agentic_turn(conv: Conversation) -> None:
                         tool_text = json.dumps(ro_result)
                         kind = "error"
                     tool_oai = {"role": "tool", "tool_call_id": tc["id"], "content": tool_text}
+                    ro_display = [{
+                        "kind": "tool_result", "name": name,
+                        "args": args,
+                        "tool_call_id": tc["id"],
+                        "text": tool_text[:600],
+                        "status": "done" if kind == "info" else "error",
+                        "category": "readonly",
+                    }]
                     conv.append(ConvMessage(
                         role="tool",
                         oai_message=tool_oai,
-                        display_blocks=[{"kind": "tool_result", "name": name,
-                                         "text": tool_text[:300],
-                                         "status": "done" if kind == "info" else "error"}],
+                        display_blocks=ro_display,
                         tool_call_id=tc["id"],
                     ))
                     base_messages.append(tool_oai)
+                    conv.events.emit("message_appended", {
+                        "role": "tool",
+                        "index": len(conv.messages) - 1,
+                        "display_blocks": ro_display,
+                        "created_at": conv.messages[-1].created_at,
+                        "turn_id": turn_id,
+                        "tool_call_id": tc["id"],
+                        "tool_name": name,
+                        "category": "readonly",
+                    })
                     conv.events.emit("tool_result", {
+                        "turn_id": turn_id,
                         "tool_call_id": tc["id"],
                         "name": name,
                         "result": ro_result,
@@ -1466,14 +1488,29 @@ async def run_agentic_turn(conv: Conversation) -> None:
                         log(f"submit {name} failed: {err}")
                         tool_oai = {"role": "tool", "tool_call_id": tc["id"],
                                     "content": json.dumps({"error": err})}
+                        err_display = [{"kind": "tool_result", "name": name,
+                                        "args": args, "tool_call_id": tc["id"],
+                                        "status": "error", "error": err,
+                                        "category": "generation"}]
                         conv.append(ConvMessage(
                             role="tool",
                             oai_message=tool_oai,
-                            display_blocks=[{"kind": "tool_error", "name": name, "error": err}],
+                            display_blocks=err_display,
                             tool_call_id=tc["id"],
                         ))
                         base_messages.append(tool_oai)
+                        conv.events.emit("message_appended", {
+                            "role": "tool",
+                            "index": len(conv.messages) - 1,
+                            "display_blocks": err_display,
+                            "created_at": conv.messages[-1].created_at,
+                            "turn_id": turn_id,
+                            "tool_call_id": tc["id"],
+                            "tool_name": name,
+                            "category": "generation",
+                        })
                         conv.events.emit("tool_result", {
+                            "turn_id": turn_id,
                             "tool_call_id": tc["id"],
                             "name": name,
                             "result": {"error": err},
@@ -1505,6 +1542,7 @@ async def run_agentic_turn(conv: Conversation) -> None:
                         "args": args,
                         "status": "queued",
                         "elapsed": 0.0,
+                        "category": "generation",
                     }
                     conv.append(ConvMessage(
                         role="tool",
@@ -1514,7 +1552,19 @@ async def run_agentic_turn(conv: Conversation) -> None:
                         job_id=job.id,
                     ))
                     base_messages.append(tool_oai)
+                    conv.events.emit("message_appended", {
+                        "role": "tool",
+                        "index": len(conv.messages) - 1,
+                        "display_blocks": [placeholder],
+                        "created_at": conv.messages[-1].created_at,
+                        "turn_id": turn_id,
+                        "tool_call_id": tc["id"],
+                        "tool_name": name,
+                        "category": "generation",
+                        "job_id": job.id,
+                    })
                     conv.events.emit("tool_result", {
+                        "turn_id": turn_id,
                         "tool_call_id": tc["id"],
                         "name": name,
                         "job_id": job.id,
@@ -1527,13 +1577,27 @@ async def run_agentic_turn(conv: Conversation) -> None:
                 err = f"unknown tool {name!r}"
                 tool_oai = {"role": "tool", "tool_call_id": tc["id"],
                             "content": json.dumps({"error": err})}
+                unk_display = [{"kind": "tool_result", "name": name,
+                                "status": "error", "error": err,
+                                "category": "readonly"}]
                 conv.append(ConvMessage(
                     role="tool", oai_message=tool_oai,
-                    display_blocks=[{"kind": "tool_error", "name": name, "error": err}],
+                    display_blocks=unk_display,
                     tool_call_id=tc["id"],
                 ))
                 base_messages.append(tool_oai)
+                conv.events.emit("message_appended", {
+                    "role": "tool",
+                    "index": len(conv.messages) - 1,
+                    "display_blocks": unk_display,
+                    "created_at": conv.messages[-1].created_at,
+                    "turn_id": turn_id,
+                    "tool_call_id": tc["id"],
+                    "tool_name": name,
+                    "category": "readonly",
+                })
                 conv.events.emit("tool_result", {
+                    "turn_id": turn_id,
                     "tool_call_id": tc["id"], "name": name,
                     "result": {"error": err}, "kind": "error",
                 })
@@ -1616,16 +1680,29 @@ async def run_lance_native_turn(conv: Conversation, user_prompt: str,
         placeholder_tc_id = new_id("tc")
         job.tool_call_id = placeholder_tc_id
         tool_text = json.dumps({"job_id": job.id, "status": "queued"})
+        text_display = [{
+            "kind": "tool_result", "name": "text_chat", "job_id": job.id,
+            "tool_call_id": placeholder_tc_id, "args": {"prompt": user_prompt},
+            "status": "queued", "elapsed": 0.0,
+            "category": "generation",
+        }]
         conv.append(ConvMessage(
             role="tool",
             oai_message={"role": "tool", "tool_call_id": placeholder_tc_id, "content": tool_text},
-            display_blocks=[{
-                "kind": "tool_result", "name": "text_chat", "job_id": job.id,
-                "tool_call_id": placeholder_tc_id, "args": {"prompt": user_prompt},
-                "status": "queued", "elapsed": 0.0,
-            }],
+            display_blocks=text_display,
             tool_call_id=placeholder_tc_id, job_id=job.id,
         ))
+        conv.events.emit("message_appended", {
+            "role": "tool",
+            "index": len(conv.messages) - 1,
+            "display_blocks": text_display,
+            "created_at": conv.messages[-1].created_at,
+            "turn_id": turn_id,
+            "tool_call_id": placeholder_tc_id,
+            "tool_name": "text_chat",
+            "category": "generation",
+            "job_id": job.id,
+        })
         state.runner.submit(job)
         conv.events.emit("turn_ended", {"turn_id": turn_id, "status": "ok"})
         return
@@ -1656,16 +1733,29 @@ async def run_lance_native_turn(conv: Conversation, user_prompt: str,
     )
     # Synthetic placeholder tool message so UI/back-fill works the same way
     tool_text = json.dumps({"job_id": job.id, "status": "queued"})
+    gen_display = [{
+        "kind": "tool_result", "name": tool_name, "job_id": job.id,
+        "tool_call_id": placeholder_tc_id, "args": {"prompt": user_prompt},
+        "status": "queued", "elapsed": 0.0,
+        "category": "generation",
+    }]
     conv.append(ConvMessage(
         role="tool",
         oai_message={"role": "tool", "tool_call_id": placeholder_tc_id, "content": tool_text},
-        display_blocks=[{
-            "kind": "tool_result", "name": tool_name, "job_id": job.id,
-            "tool_call_id": placeholder_tc_id, "args": {"prompt": user_prompt},
-            "status": "queued", "elapsed": 0.0,
-        }],
+        display_blocks=gen_display,
         tool_call_id=placeholder_tc_id, job_id=job.id,
     ))
+    conv.events.emit("message_appended", {
+        "role": "tool",
+        "index": len(conv.messages) - 1,
+        "display_blocks": gen_display,
+        "created_at": conv.messages[-1].created_at,
+        "turn_id": turn_id,
+        "tool_call_id": placeholder_tc_id,
+        "tool_name": tool_name,
+        "category": "generation",
+        "job_id": job.id,
+    })
     state.runner.submit(job)
     conv.events.emit("turn_ended", {"turn_id": turn_id, "status": "ok"})
 
@@ -1853,7 +1943,7 @@ async def conversation_events(cid: str, request: Request, from_seq: int = 0) -> 
         # 1) Replay any events from cursor onward (this catches up reconnects
         #    or first-load).
         for ev in conv.events.replay(from_seq):
-            yield _format_sse(ev.seq, ev.type, ev.payload)
+            yield _format_sse(ev.seq, ev.type, ev.payload, ts=getattr(ev, "ts", None))
         # 2) Subscribe to live events.
         q = conv.events.subscribe()
         try:
@@ -1865,7 +1955,7 @@ async def conversation_events(cid: str, request: Request, from_seq: int = 0) -> 
                 except asyncio.TimeoutError:
                     yield b": keep-alive\n\n"
                     continue
-                yield _format_sse(ev.seq, ev.type, ev.payload)
+                yield _format_sse(ev.seq, ev.type, ev.payload, ts=getattr(ev, "ts", None))
         finally:
             conv.events.unsubscribe(q)
 
@@ -1875,8 +1965,11 @@ async def conversation_events(cid: str, request: Request, from_seq: int = 0) -> 
     })
 
 
-def _format_sse(seq: int, type: str, payload: Dict[str, Any]) -> bytes:
-    body = {"seq": seq, "type": type, "payload": payload}
+def _format_sse(seq: int, type: str, payload: Dict[str, Any],
+                ts: Optional[float] = None) -> bytes:
+    body: Dict[str, Any] = {"seq": seq, "type": type, "payload": payload}
+    if ts is not None:
+        body["ts"] = ts
     return f"data: {json.dumps(body, default=str)}\n\n".encode()
 
 

@@ -166,7 +166,7 @@
         </div>`;
     }
 
-    function ToolBubble({ b, onUseAsInput, onCancelJob }) {
+    function ToolBubble({ b, onUseAsInput, onCancelJob, compact }) {
       // Tick the displayed elapsed locally so the bubble stays alive
       // between server events.
       const [tick, setTick] = useState(0);
@@ -197,6 +197,28 @@
       : status === "cancelled" ? "border-warn/40 bg-warn/5"
       : status === "queued"    ? "border-warn/30 bg-warn/5"
       :                          "border-info/40 bg-info/5";
+
+      // In "compact" mode we render as a thin one-line chip — used inside
+      // the collapsible thinking panel where we just want a trace, not the
+      // full tool bubble with prompt/result body.
+      if (compact) {
+        return html`
+          <div class="flex items-center gap-2 text-[10px] text-txt-2 leading-relaxed">
+            <span class=${
+              "inline-block w-1 h-1 rounded-full " +
+              (status === "done"      ? "bg-brand"
+              : status === "error"    ? "bg-err"
+              : status === "cancelled" ? "bg-warn"
+              : status === "queued"    ? "bg-warn pulse-dot"
+              :                          "bg-info pulse-dot")
+            }></span>
+            <span class="font-mono">${label}</span>
+            ${elapsed != null ? html`<span>· ${formatElapsed(elapsed)}</span>` : null}
+            ${b.error ? html`<span class="text-err truncate">· ${b.error.slice(0, 80)}</span>` : null}
+            ${b.text && !b.media_url ? html`
+              <span class="italic truncate max-w-xs">"${(b.text || "").slice(0, 120)}"</span>` : null}
+          </div>`;
+      }
 
       return html`
         <div class=${"rounded-xl border " + statusColor + " p-2.5 space-y-1.5"}>
@@ -243,15 +265,17 @@
     function useChat() {
       const [convId, setConvId] = useState(null);
       const [messages, setMessages] = useState([]);
+      const [turns, setTurns] = useState({});                  // turn_id -> {status, startedAt, endedAt, currentTool, streamingText}
       const [activeJobs, setActiveJobs] = useState({});         // job_id -> {status, tool, prompt, started_at}
       const [pendingAttachment, setPendingAttachment] = useState(null);
       const [busy, setBusy] = useState(false);                  // POST in-flight only
       const [streaming, setStreaming] = useState(false);        // orchestrator is generating
       const [health, setHealth] = useState(null);
 
-      const cursorRef = useRef(0);       // last event seq applied
-      const esRef     = useRef(null);    // EventSource handle
-      const convIdRef = useRef(null);
+      const cursorRef    = useRef(0);     // last event seq applied
+      const esRef        = useRef(null);  // EventSource handle
+      const convIdRef    = useRef(null);
+      const currentTurnRef = useRef(null); // most recently started turn_id (helps with stray events)
 
       // ---- Health / orchestrator probe (polled) ----
       useEffect(() => {
@@ -294,53 +318,71 @@
       }, []);
 
       // ---- Apply one event from the bus ----
+      //
+      // Events with a `turn_id` are folded into a per-turn state record so
+      // the UI can render one visual "turn block" per agentic round-trip,
+      // with intermediate text + read-only tool calls collapsed into a
+      // "thinking" panel. Generation tool messages and the final voice
+      // text stay visible outside the panel.
       const applyEvent = useCallback((ev) => {
-        const { seq, type, payload } = ev;
+        const { seq, type, payload, ts } = ev;
         if (typeof seq === "number") cursorRef.current = Math.max(cursorRef.current, seq);
+        // Server timestamp in ms (falls back to client clock on legacy events)
+        const eventTs = typeof ts === "number" ? ts * 1000 : Date.now();
+
+        const patchTurn = (turnId, patchFn) => {
+          if (!turnId) return;
+          setTurns(prev => {
+            const cur = prev[turnId] || {};
+            const next = patchFn(cur) || cur;
+            if (next === cur) return prev;
+            return { ...prev, [turnId]: next };
+          });
+        };
 
         if (type === "message_appended") {
-          // payload: {role, index, display_blocks, created_at}
-          const m = displayBlocksToMessage(payload.role, payload.display_blocks, payload.created_at);
+          // Tag the message with its turn_id and category (if any) so the
+          // renderer can group + classify it.
+          const m = displayBlocksToMessage(
+            payload.role,
+            payload.display_blocks,
+            payload.created_at,
+            { turn_id: payload.turn_id || null,
+              category: payload.category || null,
+              tool_call_id: payload.tool_call_id || null,
+              final: payload.final === true,
+            },
+          );
           setMessages(prev => [...prev, m]);
+          // For assistant messages, drop any in-flight streaming buffer for
+          // this turn — its content is now committed in the message.
+          if (payload.role === "assistant" && payload.turn_id) {
+            patchTurn(payload.turn_id, t => ({ ...t, streamingText: "" }));
+          }
         } else if (type === "text_delta") {
           setStreaming(true);
-          setMessages(prev => {
-            // Find last assistant message that's "open" (streaming text accumulating
-            // before message_appended is emitted at end of turn would mean: orchestrator
-            // is mid-response, not yet committed). We render an ephemeral streaming
-            // bubble keyed by turn_id.
-            const turnId = payload.turn_id;
-            const idx = prev.findIndex(m => m.role === "assistant_streaming" && m.turnId === turnId);
-            if (idx >= 0) {
-              const m = prev[idx];
-              const newText = (m.streamingText || "") + (payload.delta || "");
-              const newM = { ...m, streamingText: newText };
-              const next = prev.slice();
-              next[idx] = newM;
-              return next;
-            }
-            return [...prev, {
-              id: `streaming-${turnId}`,
-              role: "assistant_streaming",
-              turnId,
-              streamingText: payload.delta || "",
-            }];
-          });
+          patchTurn(payload.turn_id, t => ({
+            ...t,
+            status: t.currentTool ? "working" : "thinking",
+            streamingText: (t.streamingText || "") + (payload.delta || ""),
+          }));
         } else if (type === "tool_call") {
-          // Optional: render a "calling X..." chip. We keep it light — the
-          // next event (tool_result with queued status) will give us a full
-          // job placeholder we can render properly.
+          // The orchestrator just issued a tool call. Mark the turn as
+          // "working" with the tool's pretty name. We don't render a
+          // separate bubble here — the message_appended event for the
+          // resulting tool message will create the proper block.
+          patchTurn(payload.turn_id, t => ({
+            ...t,
+            status: "working",
+            currentTool: payload.name,
+            // Reset streaming text so the next round starts fresh
+            streamingText: "",
+          }));
         } else if (type === "tool_result") {
-          // The orchestrator received the tool's reply. For generation tools
-          // this is `{job_id, status: queued}`; the actual completion will
-          // come later as job_completed. For read-only tools it's the
-          // result data itself.
-          const r = payload.result || {};
+          patchTurn(payload.turn_id, t => ({ ...t, currentTool: null,
+            status: "thinking" }));
+          // Update activeJobs for generation tools so the banner picks them up.
           if (payload.kind === "queued" && payload.job_id) {
-            // Add the job to the active map; the placeholder bubble will be
-            // attached to the next assistant message via message_appended,
-            // but we also want to show it inline immediately so add a synthetic
-            // pending-jobs banner if no assistant message yet.
             setActiveJobs(prev => ({
               ...prev,
               [payload.job_id]: {
@@ -401,30 +443,39 @@
             const { [payload.job_id]: _drop, ...rest } = prev;
             return rest;
           });
-          upsertJobBlock(payload.job_id, {
-            status: "error",
-            error: payload.error,
-          });
+          upsertJobBlock(payload.job_id, { status: "error", error: payload.error });
         } else if (type === "job_cancelled") {
           setActiveJobs(prev => {
             const { [payload.job_id]: _drop, ...rest } = prev;
             return rest;
           });
-          upsertJobBlock(payload.job_id, {
-            status: "cancelled",
-          });
+          upsertJobBlock(payload.job_id, { status: "cancelled" });
         } else if (type === "turn_started") {
-          // no-op (we already cleared streaming on text_delta)
+          currentTurnRef.current = payload.turn_id;
+          patchTurn(payload.turn_id, () => ({
+            turn_id: payload.turn_id,
+            mode: payload.mode,
+            status: "thinking",
+            startedAt: eventTs,
+            endedAt: null,
+            streamingText: "",
+            currentTool: null,
+            toolCount: 0,
+          }));
         } else if (type === "turn_ended") {
           setStreaming(false);
-          // Drop any stale streaming bubble whose turnId matches — its text
-          // will already be present on the committed assistant message
-          // (message_appended fires before turn_ended for each round).
-          setMessages(prev => prev.filter(m =>
-            !(m.role === "assistant_streaming" && m.turnId === payload.turn_id)
-          ));
+          patchTurn(payload.turn_id, t => ({
+            ...t,
+            status: payload.status === "error" ? "error" : "done",
+            endedAt: eventTs,
+            currentTool: null,
+            streamingText: "",
+          }));
         } else if (type === "error") {
           setStreaming(false);
+          if (payload.turn_id) {
+            patchTurn(payload.turn_id, t => ({ ...t, status: "error" }));
+          }
           setMessages(prev => [...prev, {
             id: `err-${Date.now()}`,
             role: "system",
@@ -537,9 +588,11 @@
       const newChat = useCallback(() => {
         if (esRef.current) { try { esRef.current.close(); } catch(_) {} esRef.current = null; }
         setMessages([]);
+        setTurns({});
         setConvId(null);
         convIdRef.current = null;
         cursorRef.current = 0;
+        currentTurnRef.current = null;
         setActiveJobs({});
         setPendingAttachment(null);
         setStreaming(false);
@@ -548,7 +601,7 @@
       useEffect(() => () => { if (esRef.current) try { esRef.current.close(); } catch(_) {} }, []);
 
       return {
-        convId, messages, busy, streaming, health, activeJobs,
+        convId, messages, turns, busy, streaming, health, activeJobs,
         pendingAttachment, setAttachmentFromFile, setPendingAttachment,
         reattachFromUrl, submit, newChat, reprobeOrchestrator, cancelJob,
       };
@@ -557,7 +610,7 @@
     // Translate a list of server `display_blocks` into the renderer's
     // message shape. We try to keep them as similar as possible — the
     // renderer accepts {kind:"text"|"image"|"video"|"tool"|"tool_error"}.
-    function displayBlocksToMessage(role, displayBlocks, createdAt) {
+    function displayBlocksToMessage(role, displayBlocks, createdAt, meta) {
       const id = `m-${role}-${createdAt}-${Math.random().toString(36).slice(2,7)}`;
       const blocks = (displayBlocks || []).map(b => {
         if (b.kind === "text") return { kind: "text", text: b.text };
@@ -577,14 +630,23 @@
             kind_inner: b.kind_inner,
             text: b.text,
             error: b.error,
+            category: b.category || meta?.category || "readonly",
           };
         }
         if (b.kind === "tool_error") {
-          return { kind: "tool", name: b.name, status: "error", error: b.error };
+          return { kind: "tool", name: b.name, status: "error", error: b.error,
+                   category: meta?.category || "readonly" };
         }
         return null;
       }).filter(Boolean);
-      return { id, role, blocks, created_at: createdAt };
+      const m = { id, role, blocks, created_at: createdAt };
+      if (meta) {
+        if (meta.turn_id) m.turn_id = meta.turn_id;
+        if (meta.category) m.category = meta.category;
+        if (meta.tool_call_id) m.tool_call_id = meta.tool_call_id;
+        if (meta.final === true) m.final = true;
+      }
+      return m;
     }
 
     // -------------------- Components --------------------
@@ -646,68 +708,156 @@
         </div>`;
     }
 
-    function AssistantStreamingMessage({ m }) {
-      return html`
-        <div class="flex justify-start fade-up">
-          <div class="max-w-[85%] space-y-2 w-full">
-            <div class="text-[10px] uppercase tracking-wider text-brand flex items-center gap-2">
-              <span class="inline-block w-1.5 h-1.5 rounded-full bg-brand pulse-dot"></span>
-              <span>Assistant</span>
-            </div>
-            <div class="bg-bg-2 border border-line rounded-2xl rounded-bl-md px-4 py-2.5 text-sm">
-              ${m.streamingText
-                ? html`<${MarkdownBubble} text=${m.streamingText} /><span class="blink text-txt-2">▍</span>`
-                : html`<span class="text-txt-2">thinking…</span>`}
-            </div>
-          </div>
-        </div>`;
+    // Heuristic: a tool bubble is treated as "visible output" (rendered
+    // outside the thinking panel) when it has media or a job_id, or it
+    // was explicitly tagged as a generation tool by the server.
+    function isVisibleToolBlock(b) {
+      if (!b || b.kind !== "tool") return false;
+      if (b.category === "generation") return true;
+      if (b.job_id) return true;
+      if (b.media_url) return true;
+      return false;
     }
 
-    function AssistantMessage({ m, onUseAsInput, onCancelJob }) {
-      // status is derived from contained tool blocks if any
-      const toolBlocks = (m.blocks || []).filter(b => b.kind === "tool");
-      const anyError = toolBlocks.some(t => t.status === "error");
-      const anyRunning = toolBlocks.some(t => t.status === "running" || t.status === "queued");
-      const status = anyError ? "error" : anyRunning ? "running" : "done";
-
+    function TurnStatusPill({ turn }) {
+      const status = turn?.status || "thinking";
+      const tool = turn?.currentTool;
+      const elapsed = turn?.startedAt
+        ? ((turn.endedAt || Date.now()) - turn.startedAt) / 1000
+        : 0;
+      const label = (() => {
+        if (status === "error")    return "Error";
+        if (status === "done")     return elapsed > 0.05 ? `Thought for ${elapsed.toFixed(1)}s` : "Done";
+        if (status === "working")  return tool ? `Working: ${tool}…` : "Working…";
+        return "Thinking…";
+      })();
+      const color = status === "error" ? "text-err"
+                  : status === "done"  ? "text-ok"
+                  : "text-brand";
+      const dot = status === "error" ? "bg-err"
+                : status === "done"  ? "bg-ok"
+                : "bg-brand pulse-dot";
       return html`
-        <div class="flex justify-start fade-up">
-          <div class="max-w-[85%] space-y-2 w-full">
-            <div class=${"text-[10px] uppercase tracking-wider flex items-center gap-2 " +
-              (status === "error" ? "text-err" : status === "running" ? "text-brand" : "text-ok")}>
-              <span class=${"inline-block w-1.5 h-1.5 rounded-full " +
-                  (status === "running" ? "bg-brand pulse-dot"
-                : status === "error"    ? "bg-err"
-                :                          "bg-ok")}></span>
-              <span>Assistant</span>
-            </div>
-
-            ${(m.blocks || []).length > 0 ? (m.blocks || []).map((b, i) => {
-              if (b.kind === "text") {
-                return html`<div key=${i} class="bg-bg-2 border border-line rounded-2xl rounded-bl-md px-4 py-2.5 text-sm">
-                  <${MarkdownBubble} text=${b.text} />
-                </div>`;
-              }
-              if (b.kind === "tool") {
-                return html`<${ToolBubble} key=${i} b=${b} onUseAsInput=${onUseAsInput} onCancelJob=${onCancelJob} />`;
-              }
-              return null;
-            }) : null}
-          </div>
-        </div>`;
+        <span class=${"inline-flex items-center gap-1.5 text-[10px] uppercase tracking-wider " + color}>
+          <span class=${"inline-block w-1.5 h-1.5 rounded-full " + dot}></span>
+          <span>${label}</span>
+        </span>`;
     }
 
-    function ToolMessage({ m, onUseAsInput, onCancelJob }) {
-      // A standalone tool message (no associated assistant text). Renders
-      // any tool blocks at the assistant level.
-      const blocks = (m.blocks || []).filter(b => b.kind === "tool");
-      if (blocks.length === 0) return null;
+    /**
+     * Renders one orchestrator turn (i.e. all events between turn_started
+     * and turn_ended). The visible surface is:
+     *   - a small "Assistant" header pill with live status
+     *   - a collapsible "Thinking" panel that holds intermediate text,
+     *     intermediate tool calls (read-only) and any in-flight streaming
+     *     deltas before they're committed
+     *   - the *final* assistant text (the "voice") rendered as a single bubble
+     *   - any *generation* tool bubbles (with media) rendered below the voice
+     */
+    function TurnBlock({ turn, items, onUseAsInput, onCancelJob }) {
+      const isActive = turn && (turn.status === "thinking" || turn.status === "working");
+      // expanded by default while the turn is active; auto-collapses on done
+      const [manualExpand, setManualExpand] = useState(null);
+      const expanded = manualExpand == null ? isActive : manualExpand;
+
+      // Walk through the committed messages of this turn, splitting them
+      // into: (a) "voice" — the FINAL assistant text blocks, (b) "outputs"
+      // — visible generation tool bubbles, and (c) "thinking" — everything
+      // else (intermediate assistant text, read-only tool bubbles).
+      const voiceBlocks = [];
+      const outputBlocks = [];
+      const thinkingItems = []; // {kind:"text"|"tool", ...}
+
+      for (const m of items) {
+        if (m.role === "assistant") {
+          const blocks = m.blocks || [];
+          if (m.final) {
+            for (const b of blocks) {
+              if (b.kind === "text") voiceBlocks.push(b);
+              else if (b.kind === "tool") {
+                // assistant rarely owns a "tool" block now (we emit tool
+                // messages separately) but handle just in case.
+                if (isVisibleToolBlock(b)) outputBlocks.push(b);
+                else thinkingItems.push({ kind: "tool", block: b });
+              }
+            }
+          } else {
+            for (const b of blocks) {
+              if (b.kind === "text" && b.text) {
+                thinkingItems.push({ kind: "text", text: b.text });
+              } else if (b.kind === "tool") {
+                if (isVisibleToolBlock(b)) outputBlocks.push(b);
+                else thinkingItems.push({ kind: "tool", block: b });
+              }
+            }
+          }
+        } else if (m.role === "tool") {
+          for (const b of m.blocks || []) {
+            if (b.kind !== "tool") continue;
+            if (isVisibleToolBlock(b)) outputBlocks.push(b);
+            else thinkingItems.push({ kind: "tool", block: b });
+          }
+        }
+      }
+
+      // If we have an in-flight streaming buffer (no message_appended yet
+      // committed it), surface the partial text inside the thinking panel.
+      const streamingText = turn?.streamingText || "";
+
+      // Header summary chips
+      const toolsCalled = thinkingItems.filter(x => x.kind === "tool").length
+        + outputBlocks.length;
+      const chips = [];
+      if (toolsCalled > 0) chips.push(`called ${toolsCalled} tool${toolsCalled === 1 ? "" : "s"}`);
+
+      const hasThinking = thinkingItems.length > 0 || streamingText;
+      const showHeader = hasThinking || isActive;  // always show while active
+
       return html`
         <div class="flex justify-start fade-up">
-          <div class="max-w-[85%] space-y-2 w-full">
-            ${blocks.map((b, i) =>
-              html`<${ToolBubble} key=${i} b=${b} onUseAsInput=${onUseAsInput} onCancelJob=${onCancelJob} />`
-            )}
+          <div class="max-w-[85%] w-full space-y-2">
+            ${showHeader ? html`
+              <div class="flex items-center gap-2 flex-wrap">
+                <${TurnStatusPill} turn=${turn} />
+                ${chips.length > 0
+                  ? html`<span class="text-[10px] text-txt-2">· ${chips.join(" · ")}</span>`
+                  : null}
+                ${hasThinking ? html`
+                  <button onClick=${() => setManualExpand(!expanded)}
+                    class="text-[10px] text-txt-2 hover:text-txt-0 underline decoration-dotted ml-auto">
+                    ${expanded ? "hide thoughts" : "show thoughts"}
+                  </button>` : null}
+              </div>` : null}
+
+            ${expanded && hasThinking ? html`
+              <div class="border-l-2 border-line/60 pl-3 ml-1 space-y-2 opacity-90">
+                ${thinkingItems.map((it, i) => {
+                  if (it.kind === "text") {
+                    return html`<div key=${"t-"+i} class="text-xs text-txt-2 italic leading-relaxed">
+                      <${MarkdownBubble} text=${it.text} className="!text-xs" />
+                    </div>`;
+                  }
+                  if (it.kind === "tool") {
+                    return html`<${ToolBubble} key=${"tb-"+i} b=${it.block}
+                       onUseAsInput=${onUseAsInput} onCancelJob=${onCancelJob} compact=${true} />`;
+                  }
+                  return null;
+                })}
+                ${streamingText ? html`
+                  <div class="text-xs text-txt-2 italic leading-relaxed">
+                    <${MarkdownBubble} text=${streamingText} className="!text-xs" />
+                    <span class="blink text-txt-2">▍</span>
+                  </div>` : null}
+              </div>` : null}
+
+            ${voiceBlocks.length > 0 ? voiceBlocks.map((b, i) => html`
+              <div key=${"v-"+i} class="bg-bg-2 border border-line rounded-2xl rounded-bl-md px-4 py-2.5 text-sm">
+                <${MarkdownBubble} text=${b.text} />
+              </div>`) : null}
+
+            ${outputBlocks.map((b, i) => html`
+              <${ToolBubble} key=${"o-"+i} b=${b}
+                onUseAsInput=${onUseAsInput} onCancelJob=${onCancelJob} />`)}
           </div>
         </div>`;
     }
@@ -955,28 +1105,45 @@
 
       const orchOk = chat.health?.orchestrator?.reachable;
 
-      // Render in chronological order; collapse standalone tool messages
-      // into the closest preceding assistant message so the UI doesn't
-      // show empty "Assistant" headers for back-fillable tool placeholders.
-      const renderedMessages = useMemo(() => {
+      // Group messages into rendering units: user/system messages stand
+      // alone, and consecutive assistant/tool messages that share a
+      // turn_id collapse into a single TurnBlock (with a collapsible
+      // thinking panel). Any currently active turn with no committed
+      // messages yet still gets a stub block so the user sees the
+      // "Thinking…" indicator immediately on send.
+      const groups = useMemo(() => {
         const out = [];
+        const idxByTurn = {};
         for (const m of chat.messages) {
-          if (m.role === "tool") {
-            // Merge into the most recent assistant message if it has no
-            // text/tool blocks for this same job. Otherwise render as its
-            // own "tool" row.
-            const prev = out[out.length - 1];
-            if (prev && (prev.role === "assistant") && Array.isArray(prev.blocks)) {
-              prev.blocks = [...prev.blocks, ...(m.blocks || [])];
-              continue;
-            }
-            out.push({ ...m, role: "tool" });
+          if (m.role === "user") {
+            out.push({ kind: "user", message: m });
             continue;
           }
-          out.push(m);
+          if (m.role === "system") {
+            out.push({ kind: "system", message: m });
+            continue;
+          }
+          if (m.role === "assistant" || m.role === "tool") {
+            const tid = m.turn_id || `_orphan-${m.id}`;
+            if (idxByTurn[tid] == null) {
+              idxByTurn[tid] = out.length;
+              out.push({ kind: "turn", turn_id: tid, items: [m] });
+            } else {
+              out[idxByTurn[tid]].items.push(m);
+            }
+            continue;
+          }
+        }
+        // Surface any active turn that hasn't produced a committed
+        // message yet — that gives us a live "Thinking…" pill.
+        for (const [tid, t] of Object.entries(chat.turns || {})) {
+          if (idxByTurn[tid] != null) continue;
+          if (t && (t.status === "thinking" || t.status === "working")) {
+            out.push({ kind: "turn", turn_id: tid, items: [] });
+          }
         }
         return out;
-      }, [chat.messages]);
+      }, [chat.messages, chat.turns]);
 
       return html`
         <div class="h-full flex flex-col">
@@ -1007,16 +1174,23 @@
           <!-- Messages -->
           <div ref=${scrollRef} class="flex-1 overflow-y-auto">
             <div class="max-w-3xl mx-auto px-4 py-6 space-y-4 min-h-full">
-              ${renderedMessages.length === 0
+              ${groups.length === 0
                 ? html`<${EmptyState} orchOk=${orchOk} onPick=${(idea) => {
                     chat.submit({ prompt: idea.label, mode: idea.mode, useOrchestrator: orchOk });
                   }} />`
-                : renderedMessages.map(m => {
-                    if (m.role === "user")                return html`<${UserMessage} key=${m.id} m=${m} />`;
-                    if (m.role === "assistant_streaming") return html`<${AssistantStreamingMessage} key=${m.id} m=${m} />`;
-                    if (m.role === "assistant")           return html`<${AssistantMessage} key=${m.id} m=${m} onUseAsInput=${onUseAsInput} onCancelJob=${onCancelJob} />`;
-                    if (m.role === "tool")                return html`<${ToolMessage} key=${m.id} m=${m} onUseAsInput=${onUseAsInput} onCancelJob=${onCancelJob} />`;
-                    if (m.role === "system")              return html`<${SystemMessage} key=${m.id} m=${m} />`;
+                : groups.map((g, gi) => {
+                    if (g.kind === "user") {
+                      return html`<${UserMessage} key=${g.message.id} m=${g.message} />`;
+                    }
+                    if (g.kind === "system") {
+                      return html`<${SystemMessage} key=${g.message.id} m=${g.message} />`;
+                    }
+                    if (g.kind === "turn") {
+                      const turn = chat.turns?.[g.turn_id];
+                      return html`<${TurnBlock} key=${"turn-"+g.turn_id+"-"+gi}
+                        turn=${turn} items=${g.items}
+                        onUseAsInput=${onUseAsInput} onCancelJob=${onCancelJob} />`;
+                    }
                     return null;
                   })}
             </div>
