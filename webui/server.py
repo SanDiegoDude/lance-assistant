@@ -65,7 +65,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 # Make the official lance code importable BEFORE we touch torch.
 ROOT = Path(__file__).resolve().parent.parent
@@ -1310,6 +1310,7 @@ from webui.jobs import (  # noqa: E402
     JobRunner,
     new_id,
 )
+from webui import captioning  # noqa: E402
 
 
 @dataclass
@@ -1517,6 +1518,23 @@ class AppState:
                 if kind == "text":
                     blk["text"] = result.get("text", "")
 
+        # Now that the conversation history reflects the finished job,
+        # kick off a "reflection" turn so the agent can immediately look
+        # at the result and respond to the user — instead of leaving them
+        # staring at silence after "kicking it off…". We only do this when
+        # the orchestrator is reachable; native-Lance mode has no agent
+        # to react with.
+        if state.orch_probe.get("reachable", False):
+            loop = conv.events._ensure_loop()
+            if loop is not None:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _run_reflection_turn_serialized(conv, job, result, asset),
+                        loop,
+                    )
+                except RuntimeError:
+                    pass  # loop closing during shutdown
+
     # ---- factories used by message-handling code ----------------------
 
     def make_job(
@@ -1685,15 +1703,19 @@ def _record_user_message(
     user_prompt: str,
     user_attachment: Optional[Dict[str, Any]],
     output_mode: str,
-) -> None:
+) -> Tuple[int, Optional[Asset]]:
     """Append the user's message to the conversation history and emit it
     to the event bus. Handles attachments (image/video) — they become
     user-uploaded assets so the orchestrator can list them too.
+
+    Returns ``(message_index, upload_asset)`` so an async post-step
+    (attachment captioning) can patch the same ConvMessage later.
     """
     display_blocks: List[Dict[str, Any]] = []
     image_blocks: List[Dict[str, Any]] = []
     extra_text_notes: List[str] = []
     embed_user_images = state.orch_settings.embed_tool_images
+    upload_asset: Optional[Asset] = None
 
     if user_prompt:
         display_blocks.append({"kind": "text", "text": user_prompt})
@@ -1702,11 +1724,9 @@ def _record_user_message(
         kind = user_attachment["kind"]
         path = Path(user_attachment["path"])
         media_url = user_attachment.get("media_url", "")
-        display_blocks.append({
-            "kind": kind, "path": str(path), "media_url": media_url,
-            "filename": user_attachment.get("filename", path.name),
-        })
-        # Register the upload as an asset so the orchestrator can reference it
+        # Register the upload as an asset so the orchestrator can reference
+        # it, and so the UI can correlate caption events back to the
+        # thumbnail bubble.
         upload_asset = Asset(
             id=new_id("a"),
             conversation_id=conv.id,
@@ -1718,6 +1738,11 @@ def _record_user_message(
             local_path=str(path),
         )
         conv.add_asset(upload_asset)
+        display_blocks.append({
+            "kind": kind, "path": str(path), "media_url": media_url,
+            "filename": user_attachment.get("filename", path.name),
+            "asset_id": upload_asset.id,
+        })
         if kind == "image":
             if embed_user_images:
                 image_blocks.append({
@@ -1763,12 +1788,14 @@ def _record_user_message(
         oai_message={"role": "user", "content": user_oai_content},
         display_blocks=display_blocks,
     ))
+    msg_index = len(conv.messages) - 1
     conv.events.emit("message_appended", {
         "role": "user",
-        "index": len(conv.messages) - 1,
+        "index": msg_index,
         "display_blocks": display_blocks,
         "created_at": conv.messages[-1].created_at,
     })
+    return msg_index, upload_asset
 
 
 # ---------------------------------------------------------------------------
@@ -2044,6 +2071,196 @@ async def run_agentic_turn(conv: Conversation) -> None:
         log(f"agentic turn crashed: {e}\n{traceback.format_exc()}")
         conv.events.emit("error", {"turn_id": turn_id, "message": str(e)})
         conv.events.emit("turn_ended", {"turn_id": turn_id, "status": "error"})
+
+
+# ---------------------------------------------------------------------------
+# Post-job reflection — fires automatically when a Lance job finishes so
+# the agent can react to what was produced without the user having to nudge
+# it. Implemented as a small follow-up orchestrator turn that's serialized
+# behind the conversation's normal turn_lock.
+# ---------------------------------------------------------------------------
+
+async def _run_reflection_turn_serialized(
+    conv: Conversation,
+    job: JobRecord,
+    result: Dict[str, Any],
+    asset: Optional[Asset],
+) -> None:
+    """Acquire the conversation turn lock, then run a reflection turn.
+
+    Serialization behind the same lock as user-driven turns is important:
+    if the user is currently typing or mid-turn we don't want to splice
+    a reflection into their stream.
+    """
+    async with conv.turn_lock:
+        try:
+            await run_reflection_turn(conv, job, result, asset)
+        except Exception as e:  # noqa: BLE001
+            log(f"reflection turn crashed for conv {conv.id} job {job.id}: "
+                f"{e}\n{traceback.format_exc()}")
+            conv.events.emit("error", {"message": f"reflection crashed: {e}"})
+
+
+async def run_reflection_turn(
+    conv: Conversation,
+    job: JobRecord,
+    result: Dict[str, Any],
+    asset: Optional[Asset],
+) -> None:
+    """One follow-up orchestrator call after a Lance job finishes.
+
+    The agent gets to see the produced asset (when it's a VLM and asset
+    embedding is on) along with a synthetic nudge instructing it to
+    acknowledge the result. The output is appended as a normal assistant
+    message so it survives page reloads and feeds future turns.
+    Tool-calling is deliberately disabled here — we don't want reflection
+    to spawn further generation jobs and create a feedback loop.
+    """
+    kind = result.get("kind", "")
+    # Native-Lance-only deployments don't have an agent — bail.
+    if not state.orch_probe.get("reachable", False):
+        return
+
+    turn_id = new_id("t")
+    conv.events.emit("turn_started", {
+        "turn_id": turn_id,
+        "mode": "reflection",
+        "job_id": job.id,
+        "asset_id": asset.id if asset else None,
+        "result_kind": kind,
+    })
+
+    sit_lines = _situation_header(conv)
+    system_content = SYSTEM_PROMPT
+    if sit_lines:
+        system_content = SYSTEM_PROMPT + "\n\n# Current context\n" + sit_lines
+    base_messages: List[Dict[str, Any]] = [{"role": "system", "content": system_content}]
+    base_messages.extend(conv.oai_messages())
+
+    # Build the synthetic nudge that prompts the agent to react. Embedding
+    # the asset is gated on `embed_tool_images` so non-VLM orchestrators
+    # don't choke on image_url blocks.
+    nudge_blocks: List[Dict[str, Any]] = []
+    embed_ok = state.orch_settings.embed_tool_images
+    local_path = Path(asset.local_path) if (asset and asset.local_path) else None
+
+    if asset is not None and embed_ok and local_path and local_path.exists():
+        try:
+            if asset.kind == "image":
+                from webui.orchestrator import file_to_data_url as _f2d
+                nudge_blocks.append({
+                    "type": "image_url",
+                    "image_url": {"url": _f2d(local_path)},
+                })
+            elif asset.kind == "video":
+                from webui.orchestrator import bytes_to_data_url as _b2d
+                frames = captioning._extract_video_frames(
+                    local_path, fps=1.0, long_edge=512, max_frames=12,
+                )
+                for buf in frames:
+                    nudge_blocks.append({
+                        "type": "image_url",
+                        "image_url": {"url": _b2d(buf, mime="image/jpeg")},
+                    })
+        except Exception as e:  # noqa: BLE001
+            log(f"reflection: failed to embed asset {asset.id}: {e}")
+            nudge_blocks = []
+
+    nudge_text = _reflection_nudge_text(job, result, asset, has_visual=bool(nudge_blocks))
+    if nudge_blocks:
+        nudge_blocks.append({"type": "text", "text": nudge_text})
+        base_messages.append({"role": "user", "content": nudge_blocks})
+    else:
+        base_messages.append({"role": "user", "content": nudge_text})
+
+    accumulated_text = ""
+    try:
+        async for evt in state.orch_client.stream_chat(base_messages, tools=None):
+            if evt["type"] == "text":
+                accumulated_text += evt["delta"]
+                conv.events.emit("text_delta", {
+                    "turn_id": turn_id,
+                    "delta": evt["delta"],
+                    "category": "reflection",
+                })
+            elif evt["type"] == "stop":
+                break
+    except Exception as e:  # noqa: BLE001
+        log(f"reflection stream failed for job {job.id}: {e}")
+        conv.events.emit("turn_ended", {
+            "turn_id": turn_id, "mode": "reflection", "status": "error",
+        })
+        return
+
+    accumulated_text = accumulated_text.strip()
+    if accumulated_text:
+        display_blocks = [{"kind": "text", "text": accumulated_text}]
+        conv.append(ConvMessage(
+            role="assistant",
+            oai_message={"role": "assistant", "content": accumulated_text},
+            display_blocks=display_blocks,
+        ))
+        conv.events.emit("message_appended", {
+            "role": "assistant",
+            "index": len(conv.messages) - 1,
+            "display_blocks": display_blocks,
+            "created_at": conv.messages[-1].created_at,
+            "turn_id": turn_id,
+            "category": "reflection",
+            "final": True,
+        })
+
+    conv.events.emit("turn_ended", {
+        "turn_id": turn_id,
+        "mode": "reflection",
+        "status": "ok",
+    })
+
+
+def _reflection_nudge_text(
+    job: JobRecord,
+    result: Dict[str, Any],
+    asset: Optional[Asset],
+    has_visual: bool,
+) -> str:
+    """Build the system-style instruction we append as a user-role
+    message to nudge the orchestrator into reacting to the finished job.
+    """
+    kind = result.get("kind", "")
+    if kind == "error":
+        return (
+            f"(System: the generation job {job.id} ({job.tool}) just FAILED with: "
+            f"{result.get('error', 'unknown error')}. Apologise briefly to the user "
+            f"and, if appropriate, suggest a tweak they could try. Do not call any "
+            f"tools.)"
+        )
+    if kind == "text":
+        return (
+            f"(System: your earlier {job.tool} call just returned this description "
+            f"from Lance:\n\n{result.get('text', '').strip()}\n\nRelay this back to "
+            f"the user in a conversational tone — feel free to summarise or "
+            f"highlight the most interesting parts. Do not call any tools.)"
+        )
+    if asset is None:
+        return (
+            f"(System: the job {job.id} you queued just finished, but no asset is "
+            f"available. Acknowledge to the user that it completed and offer to "
+            f"retry or adjust. Do not call any tools.)"
+        )
+    media_label = "image" if asset.kind == "image" else "video"
+    visual_clause = (
+        f"You can see it above — describe briefly what came out, "
+        f"highlight anything notable, and check in with the user about what "
+        f"to do next."
+        if has_visual
+        else f"It's now visible in the chat above. Acknowledge the result "
+             f"naturally and check in with the user about what to do next."
+    )
+    return (
+        f"(System: the {media_label} you queued via {job.tool} (job {job.id}) just "
+        f"finished. {visual_clause} Keep it to one or two natural sentences. "
+        f"Do not call any tools.)"
+    )
 
 
 def _situation_header(conv: Conversation) -> str:
@@ -2368,23 +2585,37 @@ async def post_message(
     log(f"conv {cid} new msg (orchestrator={'agentic' if use_agentic else 'native'}, "
         f"attach={user_att['kind'] if user_att else None})")
 
-    # Record the user message synchronously (so the event order is sane)
-    _record_user_message(conv, prompt, user_att, mode)
+    # Record the user message synchronously (so the event order is sane).
+    user_msg_index, upload_asset = _record_user_message(conv, prompt, user_att, mode)
 
     # Kick off the turn task (non-blocking).
-    asyncio.create_task(_run_turn_serialized(conv, prompt, user_att, mode, use_agentic))
+    asyncio.create_task(_run_turn_serialized(
+        conv, prompt, user_att, mode, use_agentic,
+        user_msg_index=user_msg_index, upload_asset=upload_asset,
+    ))
 
     return JSONResponse({"queued": True, "conversation_id": cid}, status_code=202)
 
 
 async def _run_turn_serialized(conv: Conversation, prompt: str,
                                user_att: Optional[Dict[str, Any]], mode: str,
-                               use_agentic: bool) -> None:
+                               use_agentic: bool,
+                               user_msg_index: int = -1,
+                               upload_asset: Optional[Asset] = None) -> None:
     """Wrap a turn in the conversation's turn lock so concurrent user
     messages serialize cleanly. The lock has no effect on long-running
-    Lance jobs because those are now async / detached."""
+    Lance jobs because those are now async / detached.
+
+    Before the orchestrator turn fires we synchronously caption any
+    attachment the user included, so the orchestrator has a textual
+    handle on what it's looking at and doesn't hallucinate based on
+    older media in the chat. The caption is purely metadata — it never
+    appears as a visible chat message.
+    """
     async with conv.turn_lock:
         try:
+            if upload_asset is not None and user_msg_index >= 0:
+                await _caption_user_upload(conv, upload_asset, user_msg_index)
             if use_agentic:
                 await run_agentic_turn(conv)
             else:
@@ -2392,6 +2623,109 @@ async def _run_turn_serialized(conv: Conversation, prompt: str,
         except Exception as e:  # noqa: BLE001
             log(f"turn crashed for conv {conv.id}: {e}\n{traceback.format_exc()}")
             conv.events.emit("error", {"message": f"turn crashed: {e}"})
+
+
+async def _caption_user_upload(
+    conv: Conversation,
+    upload_asset: Asset,
+    user_msg_index: int,
+) -> None:
+    """One-shot: caption a freshly uploaded image/video so the
+    orchestrator stops guessing what's in it.
+
+    The result is written back to the upload asset and silently
+    prepended to the matching user message's OAI content. The chat
+    history shown to the human is untouched; the only visible signal
+    is a transient `attachment_caption_*` event the UI uses to render
+    a small status pill under the upload thumbnail.
+    """
+    if upload_asset.caption and upload_asset.caption != "(uploaded by user)":
+        return  # already captioned
+
+    if not state.orch_probe.get("reachable", False):
+        log(f"caption skipped (orchestrator unreachable) for {upload_asset.filename}")
+        upload_asset.caption = ""
+        return
+
+    # We rely on `embed_tool_images` as the user's signal that their
+    # orchestrator is a VLM. If it's off, captioning will just produce
+    # noise ("I cannot see images.") so we skip it entirely.
+    if not state.orch_settings.embed_tool_images:
+        log(f"caption skipped (orchestrator is text-only — set "
+            f"ORCHESTRATOR_EMBED_TOOL_IMAGES=on) for {upload_asset.filename}")
+        upload_asset.caption = ""
+        return
+
+    path = Path(upload_asset.local_path or "")
+    if not path.exists():
+        log(f"caption skipped (file missing) for {upload_asset.filename}")
+        return
+
+    conv.events.emit("attachment_caption_started", {
+        "asset_id": upload_asset.id,
+        "kind": upload_asset.kind,
+        "filename": upload_asset.filename,
+    })
+    start_ts = time.time()
+    try:
+        if upload_asset.kind == "image":
+            caption = await captioning.caption_image(state.orch_client, path)
+        elif upload_asset.kind == "video":
+            caption = await captioning.caption_video(state.orch_client, path)
+        else:
+            caption = ""
+    except Exception as e:  # noqa: BLE001
+        log(f"caption failed for {upload_asset.filename}: {e}")
+        conv.events.emit("attachment_caption_failed", {
+            "asset_id": upload_asset.id, "error": f"{type(e).__name__}: {e}",
+        })
+        upload_asset.caption = ""
+        return
+
+    elapsed = time.time() - start_ts
+    caption = (caption or "").strip()
+    upload_asset.caption = caption
+    log(f"captioned {upload_asset.kind} {upload_asset.filename} in {elapsed:.1f}s "
+        f"({len(caption)} chars)")
+
+    if caption:
+        _inject_caption_into_message(conv, user_msg_index, upload_asset, caption)
+
+    conv.events.emit("attachment_caption_done", {
+        "asset_id": upload_asset.id,
+        "caption": caption,
+        "elapsed_seconds": elapsed,
+    })
+
+
+def _inject_caption_into_message(
+    conv: Conversation,
+    user_msg_index: int,
+    upload_asset: Asset,
+    caption: str,
+) -> None:
+    """Prepend an `[Auto-caption …]` note to the OAI text content of the
+    user message at `user_msg_index`. The visible display_blocks are
+    NOT modified — the caption is metadata for the orchestrator only.
+    """
+    if user_msg_index < 0 or user_msg_index >= len(conv.messages):
+        return
+    msg = conv.messages[user_msg_index]
+    kind_label = "image" if upload_asset.kind == "image" else "video"
+    note = (
+        f"[Auto-caption of the attached {kind_label} "
+        f"(asset_id={upload_asset.id}): {caption}]"
+    )
+    content = msg.oai_message.get("content")
+    if isinstance(content, str):
+        msg.oai_message["content"] = f"{note}\n\n{content}" if content else note
+    elif isinstance(content, list):
+        for block in content:
+            if block.get("type") == "text":
+                existing = block.get("text", "")
+                block["text"] = f"{note}\n\n{existing}" if existing else note
+                return
+        content.insert(0, {"type": "text", "text": note})
 
 
 @app.get("/api/conversations/{cid}/events")

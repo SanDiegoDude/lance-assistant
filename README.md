@@ -15,6 +15,9 @@ This repo wraps the official ByteDance inference code in:
 - **hot-swapping** between the two Lance variants (image-focused
   `lance_3b` and video-focused `lance_3b_video`) so a single chat can
   produce both crisp-text images and video clips,
+- **auto-captioning of uploads** and **automatic post-job reflections**
+  so the agent always knows what it's looking at and reacts to what
+  Lance just produced — without the user having to nudge it,
 - **auto-downloading weights** on first run,
 - and a handful of CLI shells for direct one-shot inference and weights
   management.
@@ -85,6 +88,29 @@ diffusion step. The UI renders a live progress bar with step count and
 ETA; the orchestrator can call `get_job(job_id)` and read `progress`,
 `elapsed_seconds`, and `eta_seconds` to give the user a dynamic,
 hardware-accurate estimate (no hard-coded "wait 2 min" messages).
+
+### Auto-captioning uploads + post-job reflection
+
+Two pieces of glue make conversations with attached / generated media
+feel coherent (only active when `ORCHESTRATOR_EMBED_TOOL_IMAGES=on`,
+which signals a VLM orchestrator):
+
+- **Upload captioning** — when you attach an image or video, the server
+  fires a one-shot caption job against the orchestrator VLM. The
+  caption is silently prepended to your message text as
+  `[Auto-caption of the attached <kind> (asset_id=…): …]` so the agent
+  has a textual ground truth and stops hallucinating about which
+  upload you meant. Videos are sampled at 1 FPS, resized to 512px on
+  the long edge, and sent as a frame stack. A small "show
+  auto-caption" toggle under the thumbnail lets you see what the agent
+  saw. None of this lives in chat history.
+
+- **Post-job reflection** — after a Lance generation job finishes, the
+  server queues a brief follow-up orchestrator turn that includes the
+  produced asset. The agent responds in plain prose acknowledging what
+  came out ("Here's the corgi at sunset — the rim lighting came out
+  really well"), without you having to send another message. Reflection
+  turns can't call tools, so they never spawn cascades of generations.
 
 ### Hot-swapping image and video variants
 

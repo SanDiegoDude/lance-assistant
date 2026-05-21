@@ -120,10 +120,18 @@ Generation times depend on the user's hardware and you do NOT know it. Do not st
 
 On a later turn, if the user asks "is it ready?" or "what did you make?", call `list_jobs(status="done")` or `list_jobs(status="running")` to check. You can also see the result in your conversation history once the job completes — the tool message that originally said `{status: queued}` gets back-filled to the final result automatically.
 
+# Uploaded media + auto-captions
+
+Whenever the user uploads an image or video, the server auto-captions it once (a one-shot job done outside the chat) and prepends the caption to the user's message text as `[Auto-caption of the attached <kind> (asset_id=…): …]`. Trust that caption as ground truth — it's what's actually in the file, not invented from earlier turns. If the auto-caption is missing, treat the upload normally.
+
+# After a generation job finishes
+
+When a job you queued finishes, the server fires you a brief follow-up turn so you can react to the result. Use that opportunity to give the user a short, natural acknowledgement of what was produced ("Here's the corgi at sunset — the rim lighting came out really well"). Do not call any tools during that follow-up; just talk.
+
 # General behavior
 
 - Be a normal helpful assistant for everything that isn't a media request. Answer questions, reason, code, explain — directly, without tools.
-- When the user attaches media and asks about it, describe / analyze it yourself. You don't need a tool for that.
+- When the user attaches media and asks about it, describe / analyze it yourself (you have the auto-caption + the raw image to look at). You don't need a tool for that.
 - Never invent images / videos in your text response. Either trigger a generation tool or don't claim they exist.
 - Prefer concise responses with proper markdown. Use code fences (```language) for any code."""
 
@@ -308,6 +316,12 @@ def file_to_data_url(path: Path) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def bytes_to_data_url(data: bytes, mime: str = "image/jpeg") -> str:
+    """Wrap an in-memory image (typically a sampled video frame) as a data URL."""
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator client
 # ---------------------------------------------------------------------------
@@ -340,6 +354,49 @@ class OrchestratorClient:
             return {"reachable": True, "model": picked, "models": ids}
         except Exception as e:  # noqa: BLE001
             return {"reachable": False, "error": f"{type(e).__name__}: {e}"}
+
+    async def chat_once(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> str:
+        """Non-streaming single-shot chat completion.
+
+        Used for one-off tasks that aren't part of the visible conversation
+        — primarily attachment captioning. Returns the assistant's full
+        text response as a string (or empty string on any unparseable
+        response). Tool-calling is intentionally not supported here.
+        """
+        url = self.settings.base_url.rstrip("/") + "/chat/completions"
+        payload: Dict[str, Any] = {
+            "model": model or self.settings.model,
+            "messages": messages,
+            "temperature": self.settings.temperature if temperature is None else temperature,
+            "max_tokens": self.settings.max_tokens if max_tokens is None else max_tokens,
+            "stream": False,
+        }
+        timeout = httpx.Timeout(self.settings.request_timeout, connect=15.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(url, headers=self._headers, json=payload)
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"orchestrator HTTP {r.status_code}: {r.text[:400]}"
+                )
+            data = r.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        msg = (choices[0].get("message") or {})
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            return " ".join(
+                part.get("text", "") for part in content if part.get("type") == "text"
+            ).strip()
+        return ""
 
     async def stream_chat(
         self,

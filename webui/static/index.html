@@ -277,6 +277,7 @@
       const [messages, setMessages] = useState([]);
       const [turns, setTurns] = useState({});                  // turn_id -> {status, startedAt, endedAt, currentTool, streamingText}
       const [activeJobs, setActiveJobs] = useState({});         // job_id -> {status, tool, prompt, started_at}
+      const [captions, setCaptions] = useState({});             // asset_id -> {status: "captioning"|"done"|"failed", caption?, error?, elapsed?}
       const [pendingAttachment, setPendingAttachment] = useState(null);
       const [busy, setBusy] = useState(false);                  // POST in-flight only
       const [streaming, setStreaming] = useState(false);        // orchestrator is generating
@@ -501,6 +502,30 @@
             currentTool: null,
             streamingText: "",
           }));
+        } else if (type === "attachment_caption_started") {
+          setCaptions(prev => ({
+            ...prev,
+            [payload.asset_id]: { status: "captioning", kind: payload.kind, filename: payload.filename },
+          }));
+        } else if (type === "attachment_caption_done") {
+          setCaptions(prev => ({
+            ...prev,
+            [payload.asset_id]: {
+              ...(prev[payload.asset_id] || {}),
+              status: "done",
+              caption: payload.caption || "",
+              elapsed: payload.elapsed_seconds || 0,
+            },
+          }));
+        } else if (type === "attachment_caption_failed") {
+          setCaptions(prev => ({
+            ...prev,
+            [payload.asset_id]: {
+              ...(prev[payload.asset_id] || {}),
+              status: "failed",
+              error: payload.error || "",
+            },
+          }));
         } else if (type === "error") {
           setStreaming(false);
           if (payload.turn_id) {
@@ -631,7 +656,7 @@
       useEffect(() => () => { if (esRef.current) try { esRef.current.close(); } catch(_) {} }, []);
 
       return {
-        convId, messages, turns, busy, streaming, health, activeJobs,
+        convId, messages, turns, busy, streaming, health, activeJobs, captions,
         pendingAttachment, setAttachmentFromFile, setPendingAttachment,
         reattachFromUrl, submit, newChat, reprobeOrchestrator, cancelJob,
       };
@@ -644,8 +669,8 @@
       const id = `m-${role}-${createdAt}-${Math.random().toString(36).slice(2,7)}`;
       const blocks = (displayBlocks || []).map(b => {
         if (b.kind === "text") return { kind: "text", text: b.text };
-        if (b.kind === "image") return { kind: "image", url: b.media_url, filename: b.filename || "" };
-        if (b.kind === "video") return { kind: "video", url: b.media_url, filename: b.filename || "" };
+        if (b.kind === "image") return { kind: "image", url: b.media_url, filename: b.filename || "", asset_id: b.asset_id };
+        if (b.kind === "video") return { kind: "video", url: b.media_url, filename: b.filename || "", asset_id: b.asset_id };
         if (b.kind === "tool_result") {
           return {
             kind: "tool",
@@ -716,9 +741,10 @@
           title=${sub}>${label}</button>`;
     }
 
-    function UserMessage({ m }) {
+    function UserMessage({ m, captions }) {
       const textBlock = (m.blocks || []).find(b => b.kind === "text");
       const mediaBlock = (m.blocks || []).find(b => b.kind === "image" || b.kind === "video");
+      const caption = mediaBlock && mediaBlock.asset_id ? (captions || {})[mediaBlock.asset_id] : null;
       return html`
         <div class="flex justify-end fade-up">
           <div class="max-w-[80%] space-y-2">
@@ -729,6 +755,7 @@
                   : html`<video src=${mediaBlock.url} class="max-h-48 rounded-lg border border-line" controls/>`}
                 ${mediaBlock.filename ? html`
                   <div class="text-[10px] text-txt-2 mt-1 text-right">${mediaBlock.filename}</div>` : null}
+                ${caption ? html`<${CaptionPill} caption=${caption} />` : null}
               </div>` : null}
             ${textBlock?.text ? html`
               <div class="bg-brand/10 border border-brand/30 rounded-2xl rounded-br-md px-4 py-2.5 text-sm whitespace-pre-wrap leading-relaxed">
@@ -736,6 +763,48 @@
               </div>` : null}
           </div>
         </div>`;
+    }
+
+    // Small status pill rendered under an uploaded image/video while the
+    // background captioner is working — and a collapsible chevron showing
+    // the caption text once it's available. The caption is metadata that
+    // gets injected into the orchestrator's prompt; the chevron lets users
+    // sanity-check what the agent "saw" without cluttering the chat log.
+    function CaptionPill({ caption }) {
+      const [open, setOpen] = useState(false);
+      if (!caption) return null;
+      if (caption.status === "captioning") {
+        return html`
+          <div class="text-[10px] text-txt-2 mt-1 text-right flex items-center gap-1.5 justify-end">
+            <span class="inline-block w-1.5 h-1.5 rounded-full bg-brand pulse-dot"></span>
+            captioning attachment…
+          </div>`;
+      }
+      if (caption.status === "failed") {
+        return html`
+          <div class="text-[10px] text-warn/80 mt-1 text-right" title=${caption.error || ""}>
+            caption skipped
+          </div>`;
+      }
+      if (caption.status === "done") {
+        const text = (caption.caption || "").trim();
+        if (!text) {
+          return html`<div class="text-[10px] text-txt-2 mt-1 text-right">no caption</div>`;
+        }
+        return html`
+          <div class="mt-1 text-right">
+            <button onClick=${() => setOpen(o => !o)}
+              class="text-[10px] text-txt-2 hover:text-txt-1 inline-flex items-center gap-1">
+              <span class="inline-block w-1.5 h-1.5 rounded-full bg-ok/70"></span>
+              ${open ? "hide" : "show"} auto-caption
+            </button>
+            ${open ? html`
+              <div class="mt-1 text-[11px] text-txt-1 italic bg-bg-2 border border-line rounded-lg px-3 py-1.5 max-w-md text-left">
+                ${text}
+              </div>` : null}
+          </div>`;
+      }
+      return null;
     }
 
     // Heuristic: a tool bubble is treated as "visible output" (rendered
@@ -1210,7 +1279,7 @@
                   }} />`
                 : groups.map((g, gi) => {
                     if (g.kind === "user") {
-                      return html`<${UserMessage} key=${g.message.id} m=${g.message} />`;
+                      return html`<${UserMessage} key=${g.message.id} m=${g.message} captions=${chat.captions} />`;
                     }
                     if (g.kind === "system") {
                       return html`<${SystemMessage} key=${g.message.id} m=${g.message} />`;
