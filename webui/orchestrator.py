@@ -122,9 +122,9 @@ You have access to ByteDance Lance, a unified multimodal model. You yourself han
 # Generation tools (async — they queue a background job)
 
 - `generate_image(prompt, aspect)` — make a brand-new image from a text prompt. Use when the user asks to "draw", "create", "make", "generate", "render", "paint", "show me" an image / picture / photo / illustration.
-- `generate_video(prompt, resolution, num_frames)` — make a short video clip. Video generation is much slower than image generation, especially at higher resolutions and longer frame counts. If the user just says "make a video", default to 192p / 49 frames and warn that higher resolution or more frames takes proportionally longer.
+- `generate_video(prompt, resolution, num_frames)` — make a short video clip from a text prompt. Use when the user asks to "make", "create", "generate", "render" a video / clip / short / animation. When the user doesn't specify, default to 192p / 49 frames. Call it directly — do NOT ask for confirmation first.
 - `edit_image(instruction, asset_id?, resolution?)` — apply an edit ("make it night-time", "add a hat", "change the hair color"). Targets the most recent image by default; pass `asset_id` to edit a specific older one. Identity is preserved through the edit. `resolution` is "512" or "768" (default 768); drop to 512 only if 768 OOMs.
-- `edit_video(instruction, asset_id?, resolution?)` — same idea for video. Same speed caveats as `generate_video`. `resolution` is "192p", "360p" (default), or "480p". On 24 GB cards, 480p edits are likely to OOM — start at 360p and only step up if the user explicitly asks. If a job fails with an OOM, retry once at the next-lower resolution and tell the user what you did.
+- `edit_video(instruction, asset_id?, resolution?)` — apply an edit instruction to a video. Targets the most recent video by default; pass `asset_id` to edit a specific older one. `resolution` is "192p", "360p" (default), or "480p". On 24 GB cards, 480p edits are likely to OOM — start at 360p and only step up if the user explicitly asks. If a job fails with an OOM, retry once at the next-lower resolution and tell the user what you did. Call it directly — do NOT ask for confirmation first.
 
 # State-query tools (instant)
 
@@ -214,11 +214,10 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
     ),
     _tool(
         "generate_video",
-        "Generate a short video clip from a text prompt using the Lance video model. "
-        "Significantly slower than image generation, and cost scales with resolution and frame count. "
-        "Confirm before invoking unless the user explicitly asked for a video. "
-        "Default to 192p / 49 frames unless the user requested better quality. "
-        "Async — check progress with get_job(job_id).",
+        "Generate a new short video clip from a text prompt using the Lance video model. "
+        "Use whenever the user asks to make, create, generate, render, or show a video / "
+        "clip / short / animation. Default to 192p / 49 frames when the user doesn't specify. "
+        "Async — returns a job_id immediately; check progress with get_job(job_id).",
         {
             "type": "object",
             "properties": {
@@ -271,7 +270,7 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
     _tool(
         "edit_video",
         "Apply an edit instruction to a video in this conversation. "
-        "Slow — same speed caveats as generate_video. Confirm with the user first. "
+        "Targets the most recent video by default; pass `asset_id` to edit a specific older one. "
         "Async — returns a job_id immediately; check progress with get_job(job_id).",
         {
             "type": "object",
