@@ -748,7 +748,7 @@
         ? `Context: ${used.toLocaleString()} / ${budget.toLocaleString()} tokens used (oldest history dropped to fit)`
         : `Context: ${used.toLocaleString()} / ${budget.toLocaleString()} tokens used`;
       return html`
-        <div class=${"px-2.5 py-1 rounded-full text-[11px] " + color} title=${title}>
+        <div class=${"px-2.5 py-1 rounded-full text-[11px] whitespace-nowrap shrink-0 " + color} title=${title}>
           <span class=${"inline-block w-1.5 h-1.5 rounded-full mr-1.5 align-middle " + dot}></span>
           ${fmt(used)} / ${fmt(budget)}${ctx.truncated ? " ⤴" : ""}
         </div>`;
@@ -757,25 +757,32 @@
     function HealthPill({ info, onReprobe }) {
       const orchOk = info?.orchestrator?.reachable;
       const modelLoaded = info?.ready;
-      const orchTxt = !info
-        ? "checking…"
+      // Short visible labels — full info lives in the tooltip so the
+      // header stays compact even with very long model names.
+      const orchShort = !info ? "…" : orchOk ? "orch" : "native";
+      const orchTitle = !info
+        ? "checking orchestrator…"
         : orchOk
-          ? `orchestrator: ${info.orchestrator.model || "model"} ✓`
-          : "orchestrator: offline — native mode";
-      const lanceTxt = modelLoaded
-        ? "Lance: loaded"
-        : (info?.queue_depth ? `Lance: loading (${info.queue_depth} queued)` : "Lance: cold (loads on 1st request)");
+          ? `orchestrator: ${info.orchestrator.model || "model"} reachable — click to re-probe`
+          : "orchestrator: offline — falling back to native Lance dispatch. Click to re-probe.";
+      const lanceShort = modelLoaded
+        ? "Lance"
+        : (info?.queue_depth ? "loading" : "cold");
+      const lanceTitle = modelLoaded
+        ? "Lance: model loaded on GPU"
+        : (info?.queue_depth ? `Lance: loading (${info.queue_depth} request(s) queued)` : "Lance: not loaded yet — loads on the first request");
       return html`
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-1.5 shrink-0">
           <button onClick=${onReprobe}
-            class=${"px-2.5 py-1 rounded-full text-[11px] " + (orchOk ? "bg-ok/15 text-ok" : "bg-warn/15 text-warn") + " hover:bg-bg-3 cursor-pointer"}
-            title="Click to re-probe the orchestrator">
-            <span class=${"inline-block w-1.5 h-1.5 rounded-full mr-1.5 align-middle " + (orchOk ? "bg-ok" : "bg-warn pulse-dot")}></span>
-            ${orchTxt}
+            class=${"px-2 py-1 rounded-full text-[11px] whitespace-nowrap shrink-0 " + (orchOk ? "bg-ok/15 text-ok" : "bg-warn/15 text-warn") + " hover:bg-bg-3 cursor-pointer"}
+            title=${orchTitle}>
+            <span class=${"inline-block w-1.5 h-1.5 rounded-full mr-1 align-middle " + (orchOk ? "bg-ok" : "bg-warn pulse-dot")}></span>
+            ${orchShort}
           </button>
-          <div class=${"px-2.5 py-1 rounded-full text-[11px] " + (modelLoaded ? "bg-ok/15 text-ok" : "bg-bg-3 text-txt-2")}>
-            <span class=${"inline-block w-1.5 h-1.5 rounded-full mr-1.5 align-middle " + (modelLoaded ? "bg-ok" : "bg-txt-2")}></span>
-            ${lanceTxt}
+          <div class=${"px-2 py-1 rounded-full text-[11px] whitespace-nowrap shrink-0 " + (modelLoaded ? "bg-ok/15 text-ok" : "bg-bg-3 text-txt-2")}
+               title=${lanceTitle}>
+            <span class=${"inline-block w-1.5 h-1.5 rounded-full mr-1 align-middle " + (modelLoaded ? "bg-ok" : (info?.queue_depth ? "bg-warn pulse-dot" : "bg-txt-2"))}></span>
+            ${lanceShort}
           </div>
         </div>`;
     }
@@ -1179,7 +1186,7 @@
           ];
       return html`
         <div class="h-full flex flex-col items-center justify-center text-center px-6">
-          <div class="w-16 h-16 rounded-full overflow-hidden border border-brand/30 ring-2 ring-brand/15 shadow-lg mb-4">
+          <div class="w-24 h-24 rounded-full overflow-hidden border border-brand/30 ring-2 ring-brand/20 shadow-lg mb-4">
             <img src="/static/img/avatar-icon.png" alt="Lance avatar"
                  class="w-full h-full object-cover" />
           </div>
@@ -1347,26 +1354,26 @@
         <div class="h-full flex flex-col">
           <!-- Header -->
           <div class="border-b border-line bg-bg-1/95 backdrop-blur">
-            <div class="max-w-3xl mx-auto px-4 py-2.5 flex items-center gap-3">
-              <div class="w-8 h-8 rounded-full overflow-hidden border border-brand/40 ring-1 ring-brand/15 shrink-0"
-                   title="Lance">
-                <img src="/static/img/avatar-icon.png" alt="Lance avatar"
-                     class="w-full h-full object-cover" />
+            <div class="max-w-3xl mx-auto px-4 py-2.5 flex items-center gap-2">
+              <div class="w-7 h-7 rounded-lg bg-brand/20 border border-brand/30 flex items-center justify-center shrink-0">
+                <span class="text-sm">🪶</span>
               </div>
               <div class="flex-1 min-w-0">
-                <div class="text-sm font-medium text-txt-0">Lance Assistant</div>
+                <div class="text-sm font-medium text-txt-0 truncate">Lance Assistant</div>
                 <div class="text-[11px] text-txt-2 truncate">
                   ${orchOk
-                    ? html`<span>via <span class="font-mono">${chat.health.orchestrator.model}</span> @ ${chat.health.orchestrator.base_url}</span>`
+                    ? html`<span>via <span class="font-mono">${chat.health.orchestrator.model}</span></span>`
                     : html`<span>ByteDance Lance · 3B unified multimodal</span>`}
                 </div>
               </div>
-              <${ContextBadge} ctx=${chat.context} />
-              <button onClick=${chat.newChat}
-                class="text-[11px] text-txt-2 hover:text-txt-0 px-2 py-1 border border-line rounded-md hover:bg-bg-3">
-                New chat
-              </button>
-              <${HealthPill} info=${chat.health} onReprobe=${chat.reprobeOrchestrator} />
+              <div class="flex items-center gap-2 shrink-0">
+                <${ContextBadge} ctx=${chat.context} />
+                <button onClick=${chat.newChat}
+                  class="text-[11px] text-txt-2 hover:text-txt-0 px-2 py-1 border border-line rounded-md hover:bg-bg-3 whitespace-nowrap">
+                  New chat
+                </button>
+                <${HealthPill} info=${chat.health} onReprobe=${chat.reprobeOrchestrator} />
+              </div>
             </div>
           </div>
 
