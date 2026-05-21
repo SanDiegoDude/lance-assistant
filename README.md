@@ -446,6 +446,32 @@ the card), set the standard fragmentation hint:
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
 
+### Picking the right model variant
+
+ByteDance ships **two** fine-tunes of Lance:
+
+| Variant | Checkpoint dir | Strengths | Weaknesses |
+|---|---|---|---|
+| `image` (default) | `Lance_3B/` | Crisp in-image text, sharper detail; used for every image benchmark on the project page (GenEVAL, DPG, GEdit) | No video generation/editing |
+| `video` | `Lance_3B_Video/` | Supports `generate_video` / `edit_video` / `x2t_video` | Image text rendering is noticeably worse — words come out garbled/incoherent |
+
+Pick one with `LANCE_MODEL_VARIANT={image,video,auto}` in your `.env`. The
+default is `auto`, which prefers whichever is already on disk and falls
+back to `image` for fresh installs (the saner default since 90 % of users
+want images first).
+
+If you change the variant after the first run, the server downloads the
+other checkpoint (~30 GB) on next start. You can also pre-fetch both:
+```bash
+python -m lance download --group image  # ~30 GB
+python -m lance download --group video  # ~30 GB
+```
+
+Each checkpoint produces a different network — we don't (yet) support
+keeping both in VRAM simultaneously. If you need both image and video on
+the same install, set `LANCE_MODEL_VARIANT=video` and accept the image
+quality trade-off until we add a model-swap path.
+
 ## Fetching weights
 
 The web UI **auto-downloads** weights on first launch (`group=video`,

@@ -176,6 +176,27 @@ class LancePipeline:
     Heavily adapted from refs/lance_official/lance_gradio_t2v_v2t.py.
     """
 
+    # --- model variant selection -------------------------------------------
+    # ByteDance ships two fine-tunes of the same base architecture:
+    #   * lance_3b        — image-focused; produces the crisp-text demos on
+    #                       the project page; default for the inference_lance.sh
+    #                       script and every image-gen benchmark
+    #   * lance_3b_video  — video-focused; supports every task but with
+    #                       degraded image fidelity (worse text rendering)
+    # Pick which one to load via LANCE_MODEL_VARIANT. The "auto" option uses
+    # the image variant when it's on disk and falls back to video, which is
+    # the cheapest correct default given that 90% of users want images.
+    @staticmethod
+    def _resolve_variant() -> str:
+        v = (os.environ.get("LANCE_MODEL_VARIANT") or "auto").strip().lower()
+        if v in ("image", "img", "i", "lance_3b"):       return "image"
+        if v in ("video", "vid", "v", "lance_3b_video"): return "video"
+        return "auto"
+
+    @staticmethod
+    def _variant_dir(variant: str) -> str:
+        return "lance_3b" if variant == "image" else "lance_3b_video"
+
     def __init__(self, device: int = 0):
         self.device = device
         self.lock = threading.RLock()
@@ -189,6 +210,7 @@ class LancePipeline:
         self.base_model_args = None
         self.base_data_args = None
         self.base_inference_args = None
+        self.variant: str = "image"   # resolved in _ensure_weights_and_symlinks
 
     def initialize(self) -> None:
         with self.lock:
@@ -204,48 +226,67 @@ class LancePipeline:
     def _ensure_weights_and_symlinks(self) -> None:
         """Make sure Lance weights are present and the official code's
         downloads/ symlinks are set up. Downloads from HF on first run.
+
+        Honors LANCE_MODEL_VARIANT={image,video,auto} — for `auto` we prefer
+        the image checkpoint (better text rendering / image fidelity) and
+        fall back to whatever is already on disk.
         """
         weights_root = ROOT / "weights" / "Lance_hf"
-        required_dirs = [
-            weights_root / "Lance_3B_Video",
-            weights_root / "Qwen2.5-VL-ViT",
-        ]
+        requested = self._resolve_variant()
+        image_present = (weights_root / "Lance_3B" / "model.safetensors").exists()
+        video_present = (weights_root / "Lance_3B_Video" / "model.safetensors").exists()
+
+        if requested == "auto":
+            if image_present:
+                variant = "image"
+            elif video_present:
+                variant = "video"
+            else:
+                variant = "image"  # prefer image for fresh installs
+        else:
+            variant = requested
+
+        hf_dir   = "Lance_3B" if variant == "image" else "Lance_3B_Video"
+        dl_group = "image"    if variant == "image" else "video"
+
         required_files = [
-            weights_root / "Lance_3B_Video" / "model.safetensors",
+            weights_root / hf_dir / "model.safetensors",
             weights_root / "Qwen2.5-VL-ViT" / "vit.safetensors",
             weights_root / "Wan2.2_VAE.pth",
         ]
         need_download = not all(p.exists() for p in required_files)
         if need_download:
-            log("Lance weights missing — auto-downloading from Hugging Face")
+            log(f"Lance weights missing — auto-downloading variant={variant!r}")
             log(f"  target: {weights_root}")
-            log(f"  size:   ~32 GB (video model + ViT + VAE), resumable")
+            log(f"  size:   ~32 GB ({variant} model + ViT + VAE), resumable")
             from lance.download import GROUPS, download_files
             try:
-                download_files(weights_root, GROUPS["video"], dry_run=False)
+                download_files(weights_root, GROUPS[dl_group], dry_run=False)
             except Exception as e:  # noqa: BLE001
                 raise RuntimeError(
                     f"Auto-download failed: {e}\n"
                     f"You can run it manually with:\n"
-                    f"  python -m lance download --group video --target {weights_root}"
+                    f"  python -m lance download --group {dl_group} --target {weights_root}"
                 )
             log("auto-download complete")
-        # Wire up the symlinks the official code expects under refs/lance_official/downloads/
+        # Wire up the symlinks the official code expects under
+        # refs/lance_official/downloads/ — only required for the variant we
+        # will actually load; we still link the other one if present so
+        # users can switch variants without re-symlinking.
         official_downloads = LANCE_OFFICIAL / "downloads"
         official_downloads.mkdir(parents=True, exist_ok=True)
-        for src_rel, dst_name in [
-            ("Lance_3B",          "lance_3b"),
-            ("Lance_3B_Video",    "lance_3b_video"),
-            ("Qwen2.5-VL-ViT",    "Qwen2.5-VL-ViT"),
-            ("Wan2.2_VAE.pth",    "Wan2.2_VAE.pth"),
+        for src_rel, dst_name, required in [
+            ("Lance_3B",          "lance_3b",         variant == "image"),
+            ("Lance_3B_Video",    "lance_3b_video",   variant == "video"),
+            ("Qwen2.5-VL-ViT",    "Qwen2.5-VL-ViT",   True),
+            ("Wan2.2_VAE.pth",    "Wan2.2_VAE.pth",   True),
         ]:
             src = weights_root / src_rel
             dst = official_downloads / dst_name
             if not src.exists():
-                # lance_3b is image-only — not needed for the video pipeline
-                if src_rel == "Lance_3B":
-                    continue
-                raise RuntimeError(f"required weight missing after download: {src}")
+                if required:
+                    raise RuntimeError(f"required weight missing after download: {src}")
+                continue
             try:
                 if dst.is_symlink() or dst.exists():
                     if not dst.is_symlink() or os.readlink(dst) != str(src.resolve()):
@@ -255,6 +296,9 @@ class LancePipeline:
                     dst.symlink_to(src.resolve())
             except FileExistsError:
                 pass
+
+        self.variant = variant
+        log(f"  using Lance variant: {variant}  (checkpoint: downloads/{self._variant_dir(variant)})")
 
     def _initialize_inner(self) -> None:
         # Undo the torch.compile wrap of flex_attention from
@@ -329,10 +373,12 @@ class LancePipeline:
             )
         torch.cuda.set_device(self.device)
 
-        # The video checkpoint subsumes the image checkpoint at inference
-        # (max_num_latent_frames=31 and T_lat=1 collapses to image gen).
-        # Using it for everything keeps a single model in memory.
-        model_path = str(LANCE_OFFICIAL / "downloads" / "lance_3b_video")
+        # Use whichever variant was resolved in _ensure_weights_and_symlinks.
+        # `lance_3b` (image variant) is the one used for the project-page
+        # demos and image-gen benchmarks (GenEVAL, DPG, etc.) and produces
+        # noticeably crisper in-image text. `lance_3b_video` is the video
+        # fine-tune.
+        model_path = str(LANCE_OFFICIAL / "downloads" / self._variant_dir(self.variant))
         vit_path = str(LANCE_OFFICIAL / "downloads" / "Qwen2.5-VL-ViT")
 
         model_args = ModelArguments(
@@ -349,7 +395,7 @@ class LancePipeline:
         )
         data_args = DataArguments()
         inference_args = InferenceArguments(
-            validation_num_timesteps=30,
+            validation_num_timesteps=50,
             validation_timestep_shift=3.5,
             copy_init_moe=True,
             visual_und=True,
@@ -499,6 +545,12 @@ class LancePipeline:
         Returns the public result dict that we store on `job.result`.
         """
         self.initialize()
+        if self.variant == "image" and job.task in ("t2v", "video_edit", "x2t_video"):
+            raise RuntimeError(
+                f"task {job.task!r} requires the lance_3b_video checkpoint, "
+                f"but the server is configured with LANCE_MODEL_VARIANT=image. "
+                f"Set LANCE_MODEL_VARIANT=video in your .env and restart."
+            )
         with self.lock:
             torch.cuda.set_device(self.device)
             if job.task in ("t2i", "t2v"):
@@ -1165,6 +1217,17 @@ class AppState:
         """Translate an orchestrator tool call into a JobRecord ready for
         the JobRunner. Validates references like asset_id for edit_*.
         """
+        # Refuse video tasks if we're loaded with the image-only checkpoint
+        # (the image fine-tune has no video temporal layers — it would
+        # produce noise). Same for the inverse, but in practice the video
+        # variant *can* do images, just with degraded fidelity.
+        if tool in ("generate_video", "edit_video") and self.pipeline.variant == "image":
+            raise ValueError(
+                f"this server is running the image-only Lance variant "
+                f"(lance_3b); {tool} requires the video checkpoint. "
+                f"Set LANCE_MODEL_VARIANT=video in your .env, re-run "
+                f"setup, and restart the server."
+            )
         if tool == "generate_image":
             aspect = args.get("aspect", "square")
             sizes = {"square": (768, 768), "landscape": (1024, 576), "portrait": (576, 1024)}
@@ -1172,7 +1235,7 @@ class AppState:
             return JobRecord(
                 id=new_id("j"), conversation_id=conv.id, tool=tool, args=dict(args),
                 lance_task="t2i",
-                lance_params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
+                lance_params={"steps": 50, "cfg_text_scale": 4.0, "seed": 42,
                               "height": h, "width": w, "resolution": "image_768res",
                               "num_frames": 1, "timestep_shift": 3.5},
                 prompt=args.get("prompt", ""),
@@ -1188,7 +1251,7 @@ class AppState:
             return JobRecord(
                 id=new_id("j"), conversation_id=conv.id, tool=tool, args=dict(args),
                 lance_task="t2v",
-                lance_params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
+                lance_params={"steps": 50, "cfg_text_scale": 4.0, "seed": 42,
                               "height": h, "width": w, "resolution": res_key,
                               "num_frames": nf, "timestep_shift": 3.5},
                 prompt=args.get("prompt", ""),
@@ -1211,7 +1274,7 @@ class AppState:
             return JobRecord(
                 id=new_id("j"), conversation_id=conv.id, tool=tool, args=dict(args),
                 lance_task="image_edit",
-                lance_params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
+                lance_params={"steps": 50, "cfg_text_scale": 4.0, "seed": 42,
                               "height": 768, "width": 768, "resolution": "image_768res",
                               "num_frames": 1, "timestep_shift": 3.5},
                 prompt=args.get("instruction", ""),
@@ -1235,7 +1298,7 @@ class AppState:
             return JobRecord(
                 id=new_id("j"), conversation_id=conv.id, tool=tool, args=dict(args),
                 lance_task="video_edit",
-                lance_params={"steps": 30, "cfg_text_scale": 4.0, "seed": 42,
+                lance_params={"steps": 50, "cfg_text_scale": 4.0, "seed": 42,
                               "height": 480, "width": 832, "resolution": "video_480p",
                               "num_frames": 81, "timestep_shift": 3.5},
                 prompt=args.get("instruction", ""),
@@ -1672,6 +1735,19 @@ def _situation_header(conv: Conversation) -> str:
     orchestrator is aware of pending jobs and prior assets without having
     to call list_jobs() every turn."""
     lines: List[str] = []
+    variant = getattr(state.pipeline, "variant", "image")
+    if variant == "image":
+        lines.append(
+            "- Lance model variant: IMAGE (lance_3b). Image gen/edit and "
+            "image understanding are available. generate_video / edit_video "
+            "are NOT available on this server — do not call them."
+        )
+    else:
+        lines.append(
+            "- Lance model variant: VIDEO (lance_3b_video). All tasks are "
+            "available, though image text rendering is weaker than on the "
+            "image variant."
+        )
     active = [j for j in conv.jobs.values() if j.status in ("queued", "running")]
     done = [j for j in conv.jobs.values() if j.status == "done"]
     if active:
@@ -1767,7 +1843,7 @@ async def run_lance_native_turn(conv: Conversation, user_prompt: str,
 
     # Media task — t2i / t2v / image_edit / video_edit / x2t_*
     job_params = {
-        "steps": 30, "cfg_text_scale": 4.0, "seed": 42,
+        "steps": 50, "cfg_text_scale": 4.0, "seed": 42,
         "height": 768 if task in ("t2i", "image_edit") else 480,
         "width":  768 if task in ("t2i", "image_edit") else 832,
         "resolution": "image_768res" if task in ("t2i", "image_edit", "x2t_image") else "video_480p",
