@@ -210,8 +210,9 @@ For one-shot inference without the web UI:
 `./scripts/setup.sh` creates `.venv/`, installs the right
 torch + flash-attn for your GPU arch, clones the official Lance code
 into `refs/lance_official/`, and applies a soft-import patch for
-`decord` (only video editing / video understanding actually needs it,
-and Python 3.12 has no `decord` wheel).
+`decord` (the upstream package is unmaintained and has no Python 3.12
+wheel; the web server transparently shims out the small slice of its
+API that Lance's video edit path uses, backed by PyAV).
 
 The script auto-detects the GPU arch and installs:
 

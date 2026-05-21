@@ -73,6 +73,73 @@ LANCE_OFFICIAL = ROOT / "refs" / "lance_official"
 sys.path.insert(0, str(LANCE_OFFICIAL))
 sys.path.insert(0, str(ROOT / "src"))
 
+
+# --------------------------------------------------------------------------
+# `decord` shim — install into sys.modules BEFORE Lance's data layer can
+# `import decord`. The upstream package is unmaintained (last release 2021)
+# and has no Python 3.12 wheel, but `validation_dataset.py` calls
+# `decord.cpu(...)` and `VideoReader.get_batch(...).asnumpy()`. We satisfy
+# the tiny API surface with PyAV which is already in our dep tree.
+# --------------------------------------------------------------------------
+def _install_decord_shim() -> None:
+    import types
+    if "decord" in sys.modules and getattr(sys.modules["decord"], "_lance_assistant_shim", False):
+        return
+
+    class _AsNumpyResult:
+        def __init__(self, arr):
+            self._arr = arr
+        def asnumpy(self):
+            return self._arr
+
+    class _VideoReaderShim:
+        """Decord-compatible VideoReader backed by PyAV.
+
+        Eagerly decodes the entire clip into an in-memory (T, H, W, 3)
+        uint8 array. That's fine for Lance's edit pipeline — its frame
+        sampler caps clips at 6 seconds and we normalize to 12 FPS, so
+        every clip we hand it is <=72 frames at decode time.
+        """
+        def __init__(self, source, ctx=None, num_threads=1, **kwargs):
+            import av
+            import numpy as np
+            opened = av.open(source) if isinstance(source, str) else av.open(source)
+            try:
+                frames = []
+                for f in opened.decode(video=0):
+                    frames.append(f.to_ndarray(format="rgb24"))
+            finally:
+                opened.close()
+            if not frames:
+                raise RuntimeError(f"no frames decoded from {source!r}")
+            self._frames = np.stack(frames, axis=0)  # (T, H, W, 3)
+
+        def __len__(self) -> int:
+            return int(self._frames.shape[0])
+
+        def get_batch(self, indices):
+            import numpy as np
+            idx = list(indices)
+            if not idx:
+                raise IndexError("get_batch called with empty index list")
+            # Clamp so out-of-range indices don't throw — matches decord's
+            # forgiving behaviour and protects against off-by-one in the
+            # MultiClipsFrameSampler when source duration rounds.
+            n = self._frames.shape[0]
+            clamped = [min(max(0, int(i)), n - 1) for i in idx]
+            arr = self._frames[np.asarray(clamped, dtype=np.int64)]
+            return _AsNumpyResult(arr)
+
+    shim = types.ModuleType("decord")
+    shim.cpu = lambda i=0: None
+    shim.gpu = lambda i=0: None
+    shim.VideoReader = _VideoReaderShim
+    shim._lance_assistant_shim = True  # marker for idempotency
+    sys.modules["decord"] = shim
+
+
+_install_decord_shim()
+
 # The official lance code uses relative paths like "downloads/Wan2.2_VAE.pth"
 # and "config/path_default.yaml" — these only resolve when cwd is
 # refs/lance_official/. We chdir there at import time; all our webui paths
@@ -1350,14 +1417,14 @@ def _video_edit_num_frames(probe: Dict[str, Any], requested: int = 81) -> int:
     return 4 * k + 1
 
 
-# Lance's MultiClipsFrameSampler is hard-coded to sample at 12 FPS and
-# cap clip duration at 6 s (see validation_dataset.py: sample_fps=12,
-# max_duration=6.0). Feeding it a 24 FPS source means it temporally
-# subsamples, and on some clips that path crashes deep inside the model
-# with opaque tensor-shape errors. We avoid the whole class of problem
-# by re-encoding non-12 FPS / >6 s clips to those exact specs before
-# the edit pipeline ever sees them.
-_LANCE_VIDEO_TARGET_FPS = 12
+# Lance's MultiClipsFrameSampler caps clip duration at 6 s (see
+# validation_dataset.py: max_duration=6.0). The sampler itself
+# hard-codes ``fps=24`` in its frames_info regardless of the actual
+# file FPS — it just walks the frame array — so we don't need to
+# convert FPS. We do trim clips longer than the cap (saves memory
+# in our decord shim which eagerly decodes the whole clip) and
+# re-encode anything that isn't already a clean MP4, since PyAV is
+# happiest with that combo.
 _LANCE_VIDEO_MAX_DURATION = 6.0
 
 
@@ -1366,15 +1433,15 @@ def normalize_video_for_edit(
     dst_dir: Path,
     probe: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Path, Dict[str, Any]]:
-    """Re-encode `src` to Lance-compatible 12 FPS / <=6 s MP4 if needed.
+    """Trim & transcode `src` to a Lance-friendly MP4 if needed.
 
     Returns ``(out_path, info)`` where ``info`` is one of:
-      - ``{"normalized": False, "reason": "already compatible"}``
+      - ``{"normalized": False, "reason": "..."}``
       - ``{"normalized": True, "src_fps": ..., "src_duration": ...,
-          "out_fps": 12, "out_duration": ..., "out_frame_count": ...}``
+          "out_fps": ..., "out_duration": ..., "out_frame_count": ...}``
 
-    ``out_path`` equals ``src`` when no normalization was needed. Raises
-    ``RuntimeError`` if ffmpeg is unavailable or the conversion fails.
+    ``out_path`` equals ``src`` when no normalization was needed.
+    Raises ``RuntimeError`` if ffmpeg is unavailable or fails.
     """
     if probe is None:
         probe = probe_video(src)
@@ -1382,22 +1449,19 @@ def normalize_video_for_edit(
     src_fps = probe.get("fps") or 0.0
     src_duration = probe.get("duration_seconds") or 0.0
 
-    fps_close = abs(src_fps - _LANCE_VIDEO_TARGET_FPS) < 0.5
     duration_ok = src_duration > 0 and src_duration <= _LANCE_VIDEO_MAX_DURATION + 0.1
     container_ok = src.suffix.lower() in {".mp4"}
 
-    if fps_close and duration_ok and container_ok:
-        return src, {"normalized": False, "reason": "already 12fps and <=6s mp4"}
+    if duration_ok and container_ok:
+        return src, {"normalized": False, "reason": f"already <=6s mp4 ({src_duration:.2f}s)"}
 
     ffmpeg = _ffmpeg_binary()
     dst_dir.mkdir(parents=True, exist_ok=True)
-    dst = dst_dir / f"{src.stem}_norm12fps.mp4"
+    dst = dst_dir / f"{src.stem}_norm.mp4"
 
     cmd: List[str] = [
         ffmpeg, "-y", "-i", str(src),
-        "-r", str(_LANCE_VIDEO_TARGET_FPS),
         "-t", f"{_LANCE_VIDEO_MAX_DURATION:.2f}",
-        "-vsync", "cfr",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-pix_fmt", "yuv420p",
         "-an",  # drop audio, Lance doesn't read it
@@ -1587,10 +1651,13 @@ class AppState:
 
         if job.lance_task == "video_edit" and job.attachment_path:
             try:
-                on_progress(0, 0, "normalizing source video to 12 FPS")
                 src = Path(job.attachment_path)
+                src_probe = probe_video(src)
+                if (src_probe.get("duration_seconds") or 0) > _LANCE_VIDEO_MAX_DURATION + 0.1 \
+                        or src.suffix.lower() != ".mp4":
+                    on_progress(0, 0, "transcoding source video for Lance")
                 dst, info = normalize_video_for_edit(
-                    src, dst_dir=TMP_DIR / "normalized",
+                    src, dst_dir=TMP_DIR / "normalized", probe=src_probe,
                 )
                 if info.get("normalized"):
                     log(f"job {job.id} normalized {src.name}: "
@@ -1601,8 +1668,6 @@ class AppState:
                         f"{info.get('out_duration_seconds', 0):.2f}s "
                         f"({info.get('out_frame_count', 0)} frames)")
                     job.attachment_path = str(dst)
-                    # Recompute num_frames for the normalized clip so the
-                    # inference args reflect what Lance will actually see.
                     new_probe = {"frame_count": info.get("out_frame_count")}
                     job.lance_params["num_frames"] = _video_edit_num_frames(
                         new_probe, requested=81,
@@ -1611,10 +1676,8 @@ class AppState:
                     log(f"job {job.id} skipped video normalization: "
                         f"{info.get('reason', '')}")
             except Exception as e:  # noqa: BLE001
-                # If ffmpeg blows up we'd rather surface a clean error
-                # now than die deep in Lance's frame sampler.
                 raise RuntimeError(
-                    f"could not normalize source video for editing: {e}"
+                    f"could not prepare source video for editing: {e}"
                 )
 
         legacy = Job(
