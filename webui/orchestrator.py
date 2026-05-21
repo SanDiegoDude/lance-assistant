@@ -101,8 +101,8 @@ You have access to ByteDance Lance, a unified multimodal model. You yourself han
 
 - `generate_image(prompt, aspect)` — make a brand-new image from a text prompt. Use when the user asks to "draw", "create", "make", "generate", "render", "paint", "show me" an image / picture / photo / illustration.
 - `generate_video(prompt, resolution, num_frames)` — make a short video clip. Video generation is much slower than image generation, especially at higher resolutions and longer frame counts. If the user just says "make a video", default to 192p / 49 frames and warn that higher resolution or more frames takes proportionally longer.
-- `edit_image(instruction, asset_id?)` — apply an edit ("make it night-time", "add a hat", "change the hair color"). Targets the most recent image by default; pass `asset_id` to edit a specific older one. Identity is preserved through the edit.
-- `edit_video(instruction, asset_id?)` — same idea for video. Same speed caveats as `generate_video`.
+- `edit_image(instruction, asset_id?, resolution?)` — apply an edit ("make it night-time", "add a hat", "change the hair color"). Targets the most recent image by default; pass `asset_id` to edit a specific older one. Identity is preserved through the edit. `resolution` is "512" or "768" (default 768); drop to 512 only if 768 OOMs.
+- `edit_video(instruction, asset_id?, resolution?)` — same idea for video. Same speed caveats as `generate_video`. `resolution` is "192p", "360p" (default), or "480p". On 24 GB cards, 480p edits are likely to OOM — start at 360p and only step up if the user explicitly asks. If a job fails with an OOM, retry once at the next-lower resolution and tell the user what you did.
 
 # State-query tools (instant)
 
@@ -210,6 +210,12 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
                     "type": "string",
                     "description": "ID of the asset to edit. If omitted, uses the most recent image in the conversation. Call list_assets to discover IDs.",
                 },
+                "resolution": {
+                    "type": "string",
+                    "enum": ["512", "768"],
+                    "default": "768",
+                    "description": "Output side length. 768 is the full Lance image-edit fidelity; 512 is roughly half the peak VRAM and useful on 16-24 GB cards if 768 OOMs. Default 768.",
+                },
             },
             "required": ["instruction"],
         },
@@ -226,6 +232,12 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
                 "asset_id": {
                     "type": "string",
                     "description": "ID of the video asset to edit. If omitted, uses the most recent video.",
+                },
+                "resolution": {
+                    "type": "string",
+                    "enum": ["192p", "360p", "480p"],
+                    "default": "360p",
+                    "description": "Output resolution. 192p=320x192 (cheapest, fits comfortably on 24 GB), 360p=640x384 (balanced, default), 480p=832x480 (highest fidelity but most likely to OOM on 24 GB). Drop to 192p if a 360p job fails with an OOM.",
                 },
             },
             "required": ["instruction"],

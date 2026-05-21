@@ -317,18 +317,29 @@ they're from the patches in `webui/server.py:_apply_one_time_patches`:
 If you're still tight on memory on a 24 GB card, the things that move
 the needle next:
 
+- **Drop the edit resolution.** Both `edit_image` and `edit_video`
+  accept a `resolution` argument the orchestrator can pass through:
+  `edit_image` is `"512"` or `"768"` (default 768), `edit_video` is
+  `"192p"`, `"360p"`, or `"480p"` (default 360p). The ViT sequence
+  length scales with the square of resolution, so the difference
+  between 192p and 480p is ~9x in peak attention memory. On 24 GB
+  cards, 480p video-edits are likely to OOM even with the per-segment
+  SDPA patch — 360p is the default for that reason.
 - **`--lowvram`** keeps only one of the image / video variants resident
   at a time (saves ~8 GB at the cost of a hot-swap reload when the
   task type switches).
-- **Smaller batch / shorter clips for `edit_video`.** The job runner
-  already caps clips at 6 s before they hit Lance's frame sampler.
-- **8-bit / 4-bit weight quantization** of the LLM/ViT (bitsandbytes
-  `Linear8bitLt` or `Linear4bit`) is the obvious next step but isn't
-  wired up yet. On Ada (4090) this would roughly halve the LLM's
-  ~6 GB; the diffusion DiT and the VAE are more sensitive to
-  quantization noise and would need careful evaluation. Worth doing
-  if peak memory is still a problem after the patches above; not
-  worth doing as a first move.
+- **Shorter clips for `edit_video`.** The job runner already trims
+  clips to 6 s before they hit Lance's frame sampler.
+- **Offline-quantized weights** (not on-the-fly). The right path here
+  is to quantize the LLM (and possibly the ViT) on a high-VRAM box
+  once — `bitsandbytes` 8-bit / 4-bit, or fp8 via TransformerEngine
+  on Hopper — save the quantized checkpoint, and reuse it. On-the-fly
+  quantization at load time means we still need the full fp16/bf16
+  copy in RAM for the cast, which gives back most of the savings. The
+  diffusion DiT and the WAN VAE are more sensitive to quantization
+  noise than the LLM and would need a careful quality eval before
+  shipping a quantized variant; the LLM is the obvious first target
+  since it's the single largest chunk (~6 GB bf16 → ~3 GB int8).
 
 ### Blackwell (sm_121a) compatibility patches
 

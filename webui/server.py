@@ -1928,11 +1928,15 @@ class AppState:
                                else conv.last_image_path)
             if not attachment_path:
                 raise ValueError("no image available to edit; ask the user to attach one or generate one first")
+            res_map_img = {"512": ("image_512res", 512), "768": ("image_768res", 768)}
+            res_arg = str(args.get("resolution", "768"))
+            res_key_img, side_img = res_map_img.get(res_arg, res_map_img["768"])
             return JobRecord(
                 id=new_id("j"), conversation_id=conv.id, tool=tool, args=dict(args),
                 lance_task="image_edit",
                 lance_params={"steps": 50, "cfg_text_scale": 4.0, "seed": 42,
-                              "height": 768, "width": 768, "resolution": "image_768res",
+                              "height": side_img, "width": side_img,
+                              "resolution": res_key_img,
                               "num_frames": 1, "timestep_shift": 3.5},
                 prompt=args.get("instruction", ""),
                 attachment_path=attachment_path, attachment_kind="image",
@@ -1966,14 +1970,21 @@ class AppState:
                     f"Try a longer clip."
                 )
             num_frames = _video_edit_num_frames(probe, requested=81)
+            res_map_vid = {"192p": ("video_192p", 192, 320),
+                           "360p": ("video_360p", 384, 640),
+                           "480p": ("video_480p", 480, 832)}
+            res_arg = str(args.get("resolution", "360p"))
+            res_key_vid, h_vid, w_vid = res_map_vid.get(res_arg, res_map_vid["360p"])
             log(f"edit_video: source {Path(attachment_path).name} "
                 f"frames={probe['frame_count']} fps={probe['fps']:.1f} "
-                f"size={probe['width']}x{probe['height']} -> num_frames={num_frames}")
+                f"size={probe['width']}x{probe['height']} -> "
+                f"num_frames={num_frames} resolution={res_key_vid} ({w_vid}x{h_vid})")
             return JobRecord(
                 id=new_id("j"), conversation_id=conv.id, tool=tool, args=dict(args),
                 lance_task="video_edit",
                 lance_params={"steps": 50, "cfg_text_scale": 4.0, "seed": 42,
-                              "height": 480, "width": 832, "resolution": "video_480p",
+                              "height": h_vid, "width": w_vid,
+                              "resolution": res_key_vid,
                               "num_frames": num_frames, "timestep_shift": 3.5},
                 prompt=args.get("instruction", ""),
                 attachment_path=attachment_path, attachment_kind="video",
