@@ -130,6 +130,19 @@ entirely: nothing is written, anything from previous runs is ignored,
 and the conversation graveyard from previous sessions is left untouched
 on disk for you to remove yourself if you want.
 
+### Debug tracing
+
+`./scripts/run_webui.sh --debug` (or `LANCE_DEBUG=1`) enables verbose
+tracing through the orchestrator and agentic-turn path: every outgoing
+request (model, message roles, first-user preview), every SSE chunk
+back from the orchestrator, every tool-call name + arguments, every
+job submission, plus the branch decisions the turn loop took (final
+text vs. tool round, read-only vs. generation, etc.). Output is
+written to stdout and mirrored to `webui/tmp/logs/debug.log`
+(truncated on each start) so you can `tail -f` it from another
+terminal. The `debug()` helper is a no-op when the flag is off, so
+production runs pay nothing.
+
 ### Context budget
 
 The orchestrator's context window is configured via

@@ -28,6 +28,11 @@
 #                shutdown all conversations are gone. Use this if you
 #                don't want chat history to outlive the process.
 #                Sets LANCE_NOPERSIST=1.
+#   --debug      verbose tracing through the orchestrator + agentic-turn
+#                path: every request payload (truncated), every SSE
+#                chunk received, tool-call decisions, job submissions.
+#                Output also mirrored to webui/tmp/logs/debug.log
+#                (truncated on each start). Sets LANCE_DEBUG=1.
 #
 # Environment overrides:
 #   PYTHON          path to python (defaults to .venv/bin/python, then `python3`)
@@ -35,6 +40,7 @@
 #   PORT            bind port    (default 7861)
 #   LANCE_LOWVRAM   same as --lowvram (1 / true / yes / on enables)
 #   LANCE_NOPERSIST same as --nopersist
+#   LANCE_DEBUG     same as --debug
 #   LANCE_MODEL_VARIANT  image | video | auto (default auto — both available)
 #   LANCE_DTYPE     bfloat16 (default) | float16 | float32
 
@@ -49,6 +55,9 @@ for arg in "$@"; do
             ;;
         --nopersist)
             export LANCE_NOPERSIST=1
+            ;;
+        --debug)
+            export LANCE_DEBUG=1
             ;;
         *)
             ARGS+=("$arg")
@@ -107,6 +116,9 @@ if [ "${LANCE_LOWVRAM:-0}" = "1" ] || [ "${LANCE_LOWVRAM:-0}" = "true" ]; then
 fi
 if [ "${LANCE_NOPERSIST:-0}" = "1" ] || [ "${LANCE_NOPERSIST:-0}" = "true" ]; then
     echo "  Mode: --nopersist (conversations live in RAM only — no disk writes)"
+fi
+if [ "${LANCE_DEBUG:-0}" = "1" ] || [ "${LANCE_DEBUG:-0}" = "true" ]; then
+    echo "  Mode: --debug (verbose trace — tail webui/tmp/logs/debug.log)"
 fi
 echo "  Note: first launch will download ~32 GB of Lance weights from"
 echo "  Hugging Face into weights/Lance_hf/ (resumable, only once)."

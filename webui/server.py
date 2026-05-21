@@ -187,16 +187,63 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 # Logging
 # ---------------------------------------------------------------------------
 
-def log(msg: str) -> None:
-    print(f"[lance-webui {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
-
-
 def _env_truthy(name: str, default: bool = False) -> bool:
     """Read a boolean env var. Accepts 1/0, true/false, yes/no, on/off."""
     raw = os.environ.get(name)
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+# Debug mode is opt-in (LANCE_DEBUG=1, or scripts/run_webui.sh --debug)
+# and enables verbose tracing through the orchestrator / agentic-turn
+# path. The `debug()` helper is a no-op when off so production runs
+# pay nothing — no string formatting, no I/O.
+DEBUG = _env_truthy("LANCE_DEBUG")
+
+# Mirror every log line into webui/tmp/logs/debug.log when enabled so
+# you can tail it from another terminal and not lose anything to
+# scrollback. Rotated by simple truncate-on-start; the goal is "what
+# just happened" not long-term archival.
+_DEBUG_LOG_FH = None
+if DEBUG:
+    try:
+        _logs_dir = TMP_DIR / "logs"
+        _logs_dir.mkdir(parents=True, exist_ok=True)
+        _DEBUG_LOG_FH = open(_logs_dir / "debug.log", "w", buffering=1)
+        _DEBUG_LOG_FH.write(
+            f"=== lance-webui debug log opened "
+            f"{datetime.now().isoformat(timespec='seconds')} ===\n"
+        )
+    except Exception as _e:
+        _DEBUG_LOG_FH = None
+
+
+def log(msg: str) -> None:
+    line = f"[lance-webui {datetime.now().strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    if _DEBUG_LOG_FH is not None:
+        try:
+            _DEBUG_LOG_FH.write(line + "\n")
+        except Exception:
+            pass
+
+
+def debug(msg: str) -> None:
+    """Verbose trace logging — silent unless LANCE_DEBUG / --debug is set.
+
+    Use generously for first-turn / agentic-loop / tool-call paths;
+    every call is a no-op in production so cost is zero when off.
+    """
+    if not DEBUG:
+        return
+    line = f"[lance-debug {datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}"
+    print(line, flush=True)
+    if _DEBUG_LOG_FH is not None:
+        try:
+            _DEBUG_LOG_FH.write(line + "\n")
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -2328,7 +2375,27 @@ async def run_agentic_turn(conv: Conversation) -> None:
     base_messages.extend(conv.oai_messages())
     base_messages = _apply_context_budget(conv, base_messages)
 
-    base_messages = _apply_context_budget(conv, base_messages)
+    if DEBUG:
+        # Snapshot the user-visible roles & content lengths so we can
+        # see exactly what the orchestrator gets handed on turn entry.
+        # Critical for the first-turn video bug: confirms the user
+        # message survived the round-trip and isn't being dropped.
+        roles = [m.get("role") for m in base_messages]
+        first_user = next((m for m in base_messages if m.get("role") == "user"), None)
+        fu_preview = ""
+        if first_user:
+            fu_content = first_user.get("content")
+            if isinstance(fu_content, str):
+                fu_preview = fu_content[:300]
+            elif isinstance(fu_content, list):
+                parts = [b.get("text", "") for b in fu_content
+                         if isinstance(b, dict) and b.get("type") == "text"]
+                fu_preview = (" | ".join(parts))[:300]
+        debug(f"run_agentic_turn conv={conv.id} turn={turn_id} "
+              f"msgs={len(base_messages)} roles={roles} "
+              f"situation={sit_lines!r} first_user={fu_preview!r}")
+        debug(f"run_agentic_turn allowed_variants={_allowed_variants()} "
+              f"tools={[t['function']['name'] for t in LANCE_TOOLS]}")
 
     try:
         max_tool_rounds = 6
@@ -2336,6 +2403,8 @@ async def run_agentic_turn(conv: Conversation) -> None:
             accumulated_text = ""
             accumulated_tool_calls: List[Dict[str, Any]] = []
             base_messages = _apply_context_budget(conv, base_messages)
+            debug(f"agentic round={_round_idx} conv={conv.id} turn={turn_id} "
+                  f"msgs={len(base_messages)} -> stream_chat")
             try:
                 async for evt in state.orch_client.stream_chat(base_messages, tools=LANCE_TOOLS):
                     if evt["type"] == "text":
@@ -2344,13 +2413,23 @@ async def run_agentic_turn(conv: Conversation) -> None:
                     elif evt["type"] == "tool_call_done":
                         accumulated_tool_calls = evt["calls"]
                     elif evt["type"] == "stop":
+                        debug(f"agentic round={_round_idx} stop "
+                              f"finish_reason={evt.get('finish_reason')!r}")
                         break
             except Exception as e:  # noqa: BLE001
                 err = f"orchestrator failure: {type(e).__name__}: {e}"
                 log(err)
+                debug(f"agentic round={_round_idx} EXCEPTION {err}\n"
+                      f"{traceback.format_exc()}")
                 conv.events.emit("error", {"turn_id": turn_id, "message": err})
                 conv.events.emit("turn_ended", {"turn_id": turn_id, "status": "error"})
                 return
+
+            debug(f"agentic round={_round_idx} after stream_chat "
+                  f"text_len={len(accumulated_text)} "
+                  f"tool_calls={len(accumulated_tool_calls)} "
+                  f"names={[tc.get('name') for tc in accumulated_tool_calls]} "
+                  f"text_preview={accumulated_text[:300]!r}")
 
             # Record the assistant message (text only at first).
             assistant_msg: Dict[str, Any] = {"role": "assistant"}
@@ -2395,6 +2474,13 @@ async def run_agentic_turn(conv: Conversation) -> None:
             for tc in accumulated_tool_calls:
                 name = tc["name"]
                 args = tc.get("arguments") or {}
+                if DEBUG:
+                    try:
+                        args_repr = json.dumps(args, default=str)[:600]
+                    except Exception:
+                        args_repr = repr(args)[:600]
+                    debug(f"tool_call dispatch name={name!r} id={tc['id']} "
+                          f"args={args_repr}")
                 conv.events.emit("tool_call", {
                     "turn_id": turn_id,
                     "tool_call_id": tc["id"],
@@ -2490,6 +2576,8 @@ async def run_agentic_turn(conv: Conversation) -> None:
 
                     # Submit (non-blocking)
                     state.runner.submit(job)
+                    debug(f"job submitted id={job.id} kind={job.kind} "
+                          f"conv={conv.id} variant={getattr(job, 'variant', None)}")
                     queued_payload = {
                         "job_id": job.id,
                         "status": "queued",
@@ -3161,6 +3249,10 @@ async def post_message(
     use_agentic = use_orchestrator and state.orch_probe.get("reachable", False)
     log(f"conv {cid} new msg (orchestrator={'agentic' if use_agentic else 'native'}, "
         f"attach={user_att['kind'] if user_att else None})")
+    debug(f"post_message conv={cid} mode={mode!r} use_orchestrator={use_orchestrator} "
+          f"use_agentic={use_agentic} prompt_len={len(prompt)} "
+          f"is_first_message={len(conv.messages) == 0} "
+          f"prompt_preview={prompt[:300]!r}")
 
     # Record the user message synchronously (so the event order is sane).
     user_msg_index, upload_asset = _record_user_message(conv, prompt, user_att, mode)

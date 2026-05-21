@@ -28,10 +28,25 @@ import base64
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
+
+
+def _debug_enabled() -> bool:
+    return (os.environ.get("LANCE_DEBUG") or "").strip().lower() in {"1","true","yes","y","on"}
+
+
+def _dbg(msg: str) -> None:
+    """No-op unless LANCE_DEBUG is set. Same shape as the server's
+    debug() helper but local to this module so the orchestrator
+    client has no import-time dependency on server.py."""
+    if not _debug_enabled():
+        return
+    line = f"[lance-debug {datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}"
+    print(line, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -466,12 +481,34 @@ class OrchestratorClient:
         # `tool_call_done` event when streaming concludes.
         partial_tool_calls: Dict[int, Dict[str, Any]] = {}
         finish_reason: Optional[str] = None
+        total_text_chars = 0
+        chunks_received = 0
+
+        if _debug_enabled():
+            try:
+                last = messages[-1] if messages else {}
+                last_role = last.get("role", "?")
+                last_content = last.get("content")
+                if isinstance(last_content, str):
+                    last_preview = last_content[:200]
+                elif isinstance(last_content, list):
+                    text_parts = [b.get("text", "") for b in last_content
+                                  if isinstance(b, dict) and b.get("type") == "text"]
+                    last_preview = (" | ".join(text_parts))[:200]
+                else:
+                    last_preview = str(last_content)[:200]
+                _dbg(f"stream_chat POST {url} model={payload['model']!r} "
+                     f"messages={len(messages)} tools={len(tools or [])} "
+                     f"last_role={last_role} last={last_preview!r}")
+            except Exception:
+                pass
 
         timeout = httpx.Timeout(self.settings.request_timeout, connect=15.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("POST", url, headers=self._headers, json=payload) as r:
                 if r.status_code != 200:
                     body = (await r.aread()).decode(errors="replace")
+                    _dbg(f"stream_chat HTTP {r.status_code} body={body[:400]!r}")
                     raise RuntimeError(f"orchestrator HTTP {r.status_code}: {body[:400]}")
 
                 async for raw_line in r.aiter_lines():
@@ -480,17 +517,21 @@ class OrchestratorClient:
                         continue
                     data = line[len("data:"):].strip()
                     if data == "[DONE]":
+                        _dbg("stream_chat <- [DONE]")
                         break
                     try:
                         evt = json.loads(data)
-                    except Exception:
+                    except Exception as je:
+                        _dbg(f"stream_chat bad JSON chunk ({je}): {data[:200]!r}")
                         continue
                     choices = evt.get("choices") or []
                     if not choices:
                         continue
                     choice = choices[0]
                     delta = choice.get("delta") or {}
+                    chunks_received += 1
                     if "content" in delta and delta["content"]:
+                        total_text_chars += len(delta["content"])
                         yield {"type": "text", "delta": delta["content"]}
                     for tc in delta.get("tool_calls", []) or []:
                         idx = tc.get("index", 0)
@@ -502,6 +543,7 @@ class OrchestratorClient:
                         func = tc.get("function") or {}
                         if func.get("name"):
                             slot["name"] = func["name"]
+                            _dbg(f"stream_chat tool_call[{idx}] name={func['name']!r}")
                         if func.get("arguments"):
                             slot["arguments"] += func["arguments"]
                         yield {
@@ -513,6 +555,7 @@ class OrchestratorClient:
                         }
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
+                        _dbg(f"stream_chat finish_reason={finish_reason!r}")
 
         # Emit done event with any tool calls
         if partial_tool_calls:
@@ -522,13 +565,22 @@ class OrchestratorClient:
                 args_str = slot["arguments"] or "{}"
                 try:
                     args = json.loads(args_str)
-                except Exception:
+                except Exception as je:
+                    _dbg(f"stream_chat tool_call[{idx}] BAD JSON arguments ({je}): "
+                         f"{args_str[:400]!r}")
                     args = {"_raw": args_str}
                 final_calls.append({
                     "id": slot["id"] or f"call_{idx}",
                     "name": slot["name"] or "",
                     "arguments": args,
                 })
+            _dbg(f"stream_chat done; tool_calls={len(final_calls)} "
+                 f"names={[c['name'] for c in final_calls]} "
+                 f"text_chars={total_text_chars} chunks={chunks_received} "
+                 f"finish_reason={finish_reason!r}")
             yield {"type": "tool_call_done", "calls": final_calls}
+        else:
+            _dbg(f"stream_chat done; tool_calls=0 text_chars={total_text_chars} "
+                 f"chunks={chunks_received} finish_reason={finish_reason!r}")
 
         yield {"type": "stop", "finish_reason": finish_reason or "stop"}
