@@ -48,6 +48,19 @@ def _log(msg: str) -> None:
     print(f"[lance-jobs {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _mark_dirty(conv: Any) -> None:
+    """Best-effort persistence hook — fires ``conv._dirty()`` if the
+    conversation object exposes one. Used from worker-thread state
+    transitions where we don't have direct access to AppState.
+    """
+    try:
+        d = getattr(conv, "_dirty", None)
+        if callable(d):
+            d()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Asset
 # ---------------------------------------------------------------------------
@@ -84,6 +97,31 @@ class Asset:
             "job_id": self.job_id,
             "created_at": self.created_at,
         }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "conversation_id": self.conversation_id,
+            "kind": self.kind,
+            "url": self.url,
+            "filename": self.filename,
+            "caption": self.caption,
+            "source": self.source,
+            "job_id": self.job_id,
+            "local_path": self.local_path,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Asset":
+        return cls(
+            id=d["id"], conversation_id=d["conversation_id"],
+            kind=d["kind"], url=d["url"],
+            filename=d.get("filename", ""), caption=d.get("caption", ""),
+            source=d.get("source", "unknown"), job_id=d.get("job_id"),
+            local_path=d.get("local_path"),
+            created_at=d.get("created_at", time.time()),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +222,49 @@ class JobRecord:
             "asset_id": self.asset_id,
             "error": self.error,
         }
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Full serialization for on-disk persistence."""
+        return {
+            "id": self.id, "conversation_id": self.conversation_id,
+            "tool": self.tool, "args": self.args,
+            "lance_task": self.lance_task, "lance_params": self.lance_params,
+            "prompt": self.prompt,
+            "attachment_path": self.attachment_path,
+            "attachment_kind": self.attachment_kind,
+            "status": self.status,
+            "progress": self.progress, "progress_note": self.progress_note,
+            "step": self.step, "total_steps": self.total_steps,
+            "result": self.result, "error": self.error,
+            "error_trace": self.error_trace,
+            "created_at": self.created_at,
+            "started_at": self.started_at, "finished_at": self.finished_at,
+            "tool_call_id": self.tool_call_id, "asset_id": self.asset_id,
+            "cancel_requested": self.cancel_requested,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "JobRecord":
+        return cls(
+            id=d["id"], conversation_id=d["conversation_id"],
+            tool=d["tool"], args=d.get("args", {}),
+            lance_task=d["lance_task"], lance_params=d.get("lance_params", {}),
+            prompt=d.get("prompt", ""),
+            attachment_path=d.get("attachment_path"),
+            attachment_kind=d.get("attachment_kind"),
+            status=d.get("status", "queued"),
+            progress=d.get("progress", 0.0),
+            progress_note=d.get("progress_note", ""),
+            step=d.get("step", 0), total_steps=d.get("total_steps", 0),
+            result=d.get("result"), error=d.get("error"),
+            error_trace=d.get("error_trace"),
+            created_at=d.get("created_at", time.time()),
+            started_at=d.get("started_at"),
+            finished_at=d.get("finished_at"),
+            tool_call_id=d.get("tool_call_id"),
+            asset_id=d.get("asset_id"),
+            cancel_requested=d.get("cancel_requested", False),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +451,7 @@ class JobRunner:
             "position": position,
             "tool_call_id": job.tool_call_id,
         })
+        _mark_dirty(conv)
         self._queue.put(job)
 
     def cancel(self, job_id: str, conversation_id: Optional[str] = None) -> bool:
@@ -402,6 +484,7 @@ class JobRunner:
             conv = self._get_conv(job.conversation_id)
             if conv is not None:
                 conv.events.emit("job_cancelled", {"job_id": job.id, "tool": job.tool})
+                _mark_dirty(conv)
             return True
         # running — can't preempt, but caller knows
         return True
@@ -443,6 +526,7 @@ class JobRunner:
             "prompt": job.prompt,
             "tool_call_id": job.tool_call_id,
         })
+        _mark_dirty(conv)
 
         # Throttle progress event emission so we don't flood the SSE stream
         # — 50 denoising steps over a 2-minute generation works out to one
@@ -510,6 +594,7 @@ class JobRunner:
             except Exception as e:  # noqa: BLE001
                 _log(f"backfill error for job {job.id}: {e}")
             conv.events.emit("job_completed", payload)
+            _mark_dirty(conv)
         except Exception as e:  # noqa: BLE001
             tb = traceback.format_exc()
             # Build a short error string that includes the actual call
@@ -536,6 +621,7 @@ class JobRunner:
                 "error": err,
                 "tool_call_id": job.tool_call_id,
             })
+            _mark_dirty(conv)
         finally:
             with self._current_lock:
                 self._current = None

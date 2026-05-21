@@ -35,6 +35,10 @@ dependencies = [
     "imageio-ffmpeg",
     "tqdm",
     "av",
+    # Token estimation for the context-budget tracker. Optional at runtime
+    # (webui/tokens.py falls back to a chars/4 heuristic if missing), but
+    # having tiktoken makes the budget numbers much more accurate.
+    "tiktoken",
 ]
 
 [project.optional-dependencies]

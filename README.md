@@ -112,6 +112,44 @@ which signals a VLM orchestrator):
   really well"), without you having to send another message. Reflection
   turns can't call tools, so they never spawn cascades of generations.
 
+### Persistent conversations
+
+Conversations are dumped to `webui/tmp/state/conversations/<conv_id>.json`
+on a debounced 500 ms timer, so a restart of the server doesn't lose
+chat history, asset registry, or finished job records. In-flight jobs
+(queued or running when the server died) are rewritten as `failed` on
+restore — the worker thread that owned them is gone and Lance is not
+checkpoint-restartable mid-generation.
+
+Generated media itself (under `webui/tmp/results/`) and uploads (under
+`webui/tmp/uploads/`) are not deleted by the persistence layer, so any
+asset URL referenced by a restored conversation keeps working.
+
+Pass `--nopersist` (or set `LANCE_NOPERSIST=1`) to disable persistence
+entirely: nothing is written, anything from previous runs is ignored,
+and the conversation graveyard from previous sessions is left untouched
+on disk for you to remove yourself if you want.
+
+### Context budget
+
+The orchestrator's context window is configured via
+`ORCHESTRATOR_CONTEXT_TOKENS` (default 32 000, matching Qwen3-30B's
+native window — bump for larger models). Before every request to the
+orchestrator the server estimates the total token cost of
+`system_prompt + situation_header + history`, reserves headroom for
+the assistant's reply, and silently drops the oldest non-system /
+non-recent messages if the request would overshoot the budget. The
+UI shows a live `used / budget` badge in the header that turns yellow
+above 60 %, orange above 85 %, red above 95 %; when a drop happens,
+the UI appends a small italic system note ("dropped N older messages
+to keep the conversation alive") so it isn't invisible.
+
+Token counts are estimates: `tiktoken` (`cl100k_base`) is used when
+available, with a chars/4 fallback. Images are budgeted at a flat
+1200 tokens each, videos at ~8× that. These are conservative middle
+ground numbers — the goal is "don't overshoot the orchestrator's
+window", not "match its billed token count exactly".
+
 ### Hot-swapping image and video variants
 
 ByteDance ships two fine-tunes of Lance:

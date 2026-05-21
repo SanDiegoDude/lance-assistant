@@ -58,6 +58,12 @@ class Settings:
     # with text-only orchestrators (most local models don't accept image
     # content blocks).
     embed_tool_images: bool = False
+    # Total context window of the orchestrator model, in tokens. We use
+    # this to keep long conversations from blowing past the model's limit
+    # by silently trimming the oldest non-system history when needed.
+    # The server reserves a small headroom for the assistant's reply
+    # (``max_tokens``) and tool-call overhead.
+    context_tokens: int = 32000
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -86,6 +92,7 @@ class Settings:
             request_timeout=float(os.getenv("ORCHESTRATOR_REQUEST_TIMEOUT", "600")),
             enabled=enabled,
             embed_tool_images=_truthy(os.getenv("ORCHESTRATOR_EMBED_TOOL_IMAGES", "off")),
+            context_tokens=int(os.getenv("ORCHESTRATOR_CONTEXT_TOKENS", "32000")),
         )
 
 
@@ -128,6 +135,32 @@ Whenever the user uploads an image or video, the server auto-captions it once (a
 
 When a job you queued finishes, the server fires you a brief follow-up turn so you can react to the result. Use that opportunity to give the user a short, natural acknowledgement of what was produced ("Here's the corgi at sunset — the rim lighting came out really well"). Do not call any tools during that follow-up; just talk.
 
+# Prompt shape for image and video generation
+
+Lance's text encoder responds much better to *structured* prompts than to free-form prose. When you call `generate_image` or `generate_video`, pass the `prompt` argument as a compact JSON object with the fields below (omit fields that don't apply — don't pad with empty strings). Send the JSON as a plain string in the `prompt` field; the server forwards it verbatim.
+
+Fields:
+- `subject` — who/what is featured
+- `pose` — body position and posture (static or dynamic)
+- `action` — what they're doing (verb-driven)
+- `expression` — facial expression
+- `outfit` — clothing and accessories
+- `background` — environment, setting, time of day, notable features
+- `lighting` — light quality and direction (golden hour, studio rim, dramatic shadows, soft diffused, etc.)
+- `camera` — shot composition (eye-level, low angle, close-up, wide, depth-of-field notes)
+- `style` — artistic style or medium (photorealistic, anime, oil painting, watercolor, pixel art, …)
+- `notes` — extra constraints to include or avoid (e.g. "no text visible", "high shutter speed")
+- `motion` — *video only* — camera motion + scene action over time (slow dolly in, character walks left to right, water ripples)
+- `duration_note` — *video only* — pacing hint (single beat, multiple shots, etc.)
+
+Important rules:
+- Write the user's actual creative intent into the relevant fields. Translate, don't copy. If the user says "a cat in a wizard hat reading a spell book in a candlelit library", you populate subject/outfit/action/background/lighting yourself.
+- **Do not include illustrative examples in the prompt JSON itself.** Lance treats them as part of the description and they bleed into the output. The user's intent is the only content that matters.
+- Skip any field that doesn't have a natural value. An empty key is worse than no key.
+- If the user has given you a very specific prompt of their own (a JSON, a paragraph, a single line), respect it: don't rewrite or expand beyond what they said.
+
+`edit_image` and `edit_video` are different — the `instruction` argument is plain text describing the change ("change hair color to dark green", "replace background with a forest", "make it night-time"). Don't JSON-wrap edit instructions.
+
 # General behavior
 
 - Be a normal helpful assistant for everything that isn't a media request. Answer questions, reason, code, explain — directly, without tools.
@@ -152,7 +185,7 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "Detailed visual description of the image. Be specific about subject, style, lighting, composition, and any text to render. The model is great at both photorealistic and stylized images.",
+                    "description": "Compact JSON object describing the image (passed verbatim to Lance). Fields: subject, pose, action, expression, outfit, background, lighting, camera, style, notes. Omit fields that don't apply. Do NOT include illustrative examples inside the values — Lance treats them as part of the description. See the system prompt for the full schema.",
                 },
                 "aspect": {
                     "type": "string",
@@ -176,7 +209,7 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "Detailed visual description for the video. Include camera motion, scene action, and style.",
+                    "description": "Compact JSON object describing the clip (passed verbatim to Lance). Use the image-prompt fields plus `motion` (camera + scene motion over time) and `duration_note` (pacing). Omit unused fields. Do NOT include examples inside the values. See the system prompt for the full schema.",
                 },
                 "resolution": {
                     "type": "string",

@@ -11,7 +11,8 @@
 #   ./scripts/run_webui.sh                  # binds 0.0.0.0:7861
 #   ./scripts/run_webui.sh 8080             # custom port
 #   ./scripts/run_webui.sh --lowvram        # one variant on GPU at a time
-#   ./scripts/run_webui.sh --lowvram 8080
+#   ./scripts/run_webui.sh --nopersist      # don't write conversations to disk
+#   ./scripts/run_webui.sh --lowvram --nopersist 8080
 #   PORT=8080 HOST=127.0.0.1 ./scripts/run_webui.sh
 #
 # Flags:
@@ -20,26 +21,41 @@
 #                parked in system RAM). Sets LANCE_LOWVRAM=1. Recommended
 #                for 24 GB cards (4090); leave off on big-VRAM hardware
 #                so both variants stay GPU-resident and swap is free.
+#   --nopersist  do NOT save conversations to disk. The default is to
+#                store every chat under webui/tmp/state/ so it survives
+#                a server restart. With --nopersist nothing is written
+#                and any state from previous runs is ignored; on
+#                shutdown all conversations are gone. Use this if you
+#                don't want chat history to outlive the process.
+#                Sets LANCE_NOPERSIST=1.
 #
 # Environment overrides:
 #   PYTHON          path to python (defaults to .venv/bin/python, then `python3`)
 #   HOST            bind address (default 0.0.0.0)
 #   PORT            bind port    (default 7861)
 #   LANCE_LOWVRAM   same as --lowvram (1 / true / yes / on enables)
+#   LANCE_NOPERSIST same as --nopersist
 #   LANCE_MODEL_VARIANT  image | video | auto (default auto — both available)
 #   LANCE_DTYPE     bfloat16 (default) | float16 | float32
 
 set -euo pipefail
 
 # Parse our own flags before falling through to positional args.
+ARGS=()
 for arg in "$@"; do
     case "$arg" in
         --lowvram)
             export LANCE_LOWVRAM=1
-            shift
+            ;;
+        --nopersist)
+            export LANCE_NOPERSIST=1
+            ;;
+        *)
+            ARGS+=("$arg")
             ;;
     esac
 done
+set -- "${ARGS[@]}"
 
 PORT="${1:-${PORT:-7861}}"
 HOST="${HOST:-0.0.0.0}"
@@ -88,6 +104,9 @@ echo "  Open  http://${HOST}:${PORT}  (or http://localhost:${PORT})"
 echo ""
 if [ "${LANCE_LOWVRAM:-0}" = "1" ] || [ "${LANCE_LOWVRAM:-0}" = "true" ]; then
     echo "  Mode: --lowvram (one variant on GPU at a time, hot-swap on demand)"
+fi
+if [ "${LANCE_NOPERSIST:-0}" = "1" ] || [ "${LANCE_NOPERSIST:-0}" = "true" ]; then
+    echo "  Mode: --nopersist (conversations live in RAM only — no disk writes)"
 fi
 echo "  Note: first launch will download ~32 GB of Lance weights from"
 echo "  Hugging Face into weights/Lance_hf/ (resumable, only once)."

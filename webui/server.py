@@ -1611,6 +1611,27 @@ class ConvMessage:
     tool_call_id: Optional[str] = None
     job_id: Optional[str] = None    # set when this message is the orchestrator's queue-placeholder
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "role": self.role,
+            "oai_message": self.oai_message,
+            "display_blocks": self.display_blocks,
+            "created_at": self.created_at,
+            "tool_call_id": self.tool_call_id,
+            "job_id": self.job_id,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ConvMessage":
+        return cls(
+            role=d["role"],
+            oai_message=d.get("oai_message", {}),
+            display_blocks=d.get("display_blocks", []),
+            created_at=d.get("created_at", time.time()),
+            tool_call_id=d.get("tool_call_id"),
+            job_id=d.get("job_id"),
+        )
+
 
 @dataclass
 class Conversation:
@@ -1625,6 +1646,19 @@ class Conversation:
     # and as the default target for edit_* when no asset_id is given).
     last_image_path: Optional[str] = None
     last_video_path: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    # Persistence hook — invoked by mutators so the persistence layer
+    # can debounce a save. Set by AppState right after construction.
+    on_change: Optional[Any] = None
+
+    def _dirty(self) -> None:
+        self.updated_at = time.time()
+        if self.on_change is not None:
+            try:
+                self.on_change(self.id)
+            except Exception:
+                pass
 
     def append(self, m: ConvMessage) -> None:
         self.messages.append(m)
@@ -1633,9 +1667,49 @@ class Conversation:
                 self.last_image_path = blk.get("path") or self.last_image_path
             elif blk.get("kind") == "video":
                 self.last_video_path = blk.get("path") or self.last_video_path
+        self._dirty()
 
     def oai_messages(self) -> List[Dict[str, Any]]:
         return [m.oai_message for m in self.messages]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "messages": [m.to_dict() for m in self.messages],
+            "assets": [a.to_dict() for a in self.assets],
+            "jobs": {jid: j.to_dict() for jid, j in self.jobs.items()},
+            "last_image_path": self.last_image_path,
+            "last_video_path": self.last_video_path,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Conversation":
+        """Reconstruct a Conversation from a persisted dict.
+
+        ``events`` and ``turn_lock`` start fresh — both are runtime-only.
+        Any job that was queued/running when the server died gets
+        rewritten as ``failed`` since we no longer own its worker.
+        """
+        conv = cls(id=d["id"])
+        conv.messages = [ConvMessage.from_dict(m) for m in d.get("messages", [])]
+        conv.assets = [Asset.from_dict(a) for a in d.get("assets", [])]
+        for jid, jdict in (d.get("jobs") or {}).items():
+            job = JobRecord.from_dict(jdict)
+            if job.status in ("queued", "running"):
+                job.status = "failed"
+                if not job.error:
+                    job.error = ("server restarted while this job was in flight; "
+                                 "results are no longer recoverable")
+                if job.finished_at is None:
+                    job.finished_at = time.time()
+            conv.jobs[jid] = job
+        conv.last_image_path = d.get("last_image_path")
+        conv.last_video_path = d.get("last_video_path")
+        conv.created_at = d.get("created_at", time.time())
+        conv.updated_at = d.get("updated_at", conv.created_at)
+        return conv
 
     # ---- asset helpers -------------------------------------------------
 
@@ -1646,6 +1720,7 @@ class Conversation:
                 self.last_image_path = asset.local_path
             elif asset.kind == "video":
                 self.last_video_path = asset.local_path
+        self._dirty()
 
     def find_asset(self, asset_id: str) -> Optional[Asset]:
         for a in self.assets:
@@ -1680,6 +1755,13 @@ class AppState:
         self.orch_probe: Dict[str, Any] = {"reachable": False, "model": "", "models": [], "error": "not probed yet"}
         # Conversations
         self.conversations: Dict[str, Conversation] = {}
+        # Persistence (off when LANCE_NOPERSIST=1)
+        from webui.persistence import PersistenceStore, is_nopersist_env
+        self.persistence = PersistenceStore(
+            base_dir=WEBUI_DIR / "tmp" / "state",
+            enabled=not is_nopersist_env(),
+        )
+        self.persistence.set_serializer(self._serialize_conversation)
         # Async job runtime (single FIFO worker, started in app startup)
         self.runner: JobRunner = JobRunner(
             get_conversation=self.conversations.get,
@@ -1687,6 +1769,16 @@ class AppState:
             build_asset=self._build_asset,
             backfill_tool_message=self._backfill_tool_message,
         )
+
+    def _serialize_conversation(self, cid: str) -> Optional[Dict[str, Any]]:
+        conv = self.conversations.get(cid)
+        if conv is None:
+            return None
+        return conv.to_dict()
+
+    def mark_dirty(self, cid: str) -> None:
+        """Schedule ``cid`` for the next debounced persistence flush."""
+        self.persistence.mark_dirty(cid)
 
     # ---- callbacks invoked by JobRunner --------------------------------
 
@@ -1842,6 +1934,7 @@ class AppState:
                     blk["error"] = result.get("error", "")
                 if kind == "text":
                     blk["text"] = result.get("text", "")
+        conv._dirty()  # ensure the backfill survives a restart
 
         # Now that the conversation history reflects the finished job,
         # kick off a "reflection" turn so the agent can immediately look
@@ -2152,6 +2245,64 @@ def _record_user_message(
 
 
 # ---------------------------------------------------------------------------
+# Context budget — keep long conversations from exploding the orchestrator
+# ---------------------------------------------------------------------------
+
+def _apply_context_budget(
+    conv: Conversation,
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Trim the oldest non-system / non-recent history if the request
+    would otherwise exceed the configured orchestrator context window.
+
+    The budget reserves headroom for the assistant's reply
+    (``ORCHESTRATOR_MAX_TOKENS``) plus a small safety margin for tool
+    metadata. Emits a ``context_usage`` event so the UI can show the
+    current load, and a ``context_truncated`` event whenever we have
+    to drop messages so the user knows it happened.
+    """
+    from webui.tokens import (
+        estimate_messages_tokens,
+        truncate_to_budget,
+    )
+
+    settings = state.orch_settings
+    headroom = max(512, int(settings.max_tokens)) + 1024  # tool overhead pad
+    total = max(2048, int(settings.context_tokens))
+    budget = max(2048, total - headroom)
+
+    before = estimate_messages_tokens(messages)
+    if before <= budget:
+        conv.events.emit("context_usage", {
+            "tokens_used": before,
+            "tokens_budget": budget,
+            "tokens_total": total,
+            "truncated": False,
+        })
+        return messages
+
+    new_msgs, _before, after, dropped = truncate_to_budget(
+        messages, budget, keep_recent=12,
+    )
+    log(f"context budget: trimmed conv {conv.id} from {before} to {after} tokens "
+        f"(dropped {dropped} of {len(messages)} messages)")
+    conv.events.emit("context_truncated", {
+        "tokens_before": before,
+        "tokens_after": after,
+        "tokens_budget": budget,
+        "tokens_total": total,
+        "messages_dropped": dropped,
+    })
+    conv.events.emit("context_usage", {
+        "tokens_used": after,
+        "tokens_budget": budget,
+        "tokens_total": total,
+        "truncated": True,
+    })
+    return new_msgs
+
+
+# ---------------------------------------------------------------------------
 # Agentic conversation runner — emits to event bus, async-submits Lance jobs
 # ---------------------------------------------------------------------------
 
@@ -2175,12 +2326,16 @@ async def run_agentic_turn(conv: Conversation) -> None:
         system_content = SYSTEM_PROMPT + "\n\n# Current context\n" + sit_lines
     base_messages: List[Dict[str, Any]] = [{"role": "system", "content": system_content}]
     base_messages.extend(conv.oai_messages())
+    base_messages = _apply_context_budget(conv, base_messages)
+
+    base_messages = _apply_context_budget(conv, base_messages)
 
     try:
         max_tool_rounds = 6
         for _round_idx in range(max_tool_rounds):
             accumulated_text = ""
             accumulated_tool_calls: List[Dict[str, Any]] = []
+            base_messages = _apply_context_budget(conv, base_messages)
             try:
                 async for evt in state.orch_client.stream_chat(base_messages, tools=LANCE_TOOLS):
                     if evt["type"] == "text":
@@ -2489,6 +2644,7 @@ async def run_reflection_turn(
         system_content = SYSTEM_PROMPT + "\n\n# Current context\n" + sit_lines
     base_messages: List[Dict[str, Any]] = [{"role": "system", "content": system_content}]
     base_messages.extend(conv.oai_messages())
+    base_messages = _apply_context_budget(conv, base_messages)
 
     # Build the synthetic nudge that prompts the agent to react. Embedding
     # the asset is gated on `embed_tool_images` so non-VLM orchestrators
@@ -2873,12 +3029,66 @@ async def serve_upload(name: str) -> FileResponse:
 async def create_conversation() -> Dict[str, Any]:
     cid = uuid.uuid4().hex
     conv = Conversation(id=cid)
+    conv.on_change = state.mark_dirty
     # Bind the bus to the running loop now so JobRunner emissions schedule
     # correctly.
     conv.events.bind_loop(asyncio.get_running_loop())
     state.conversations[cid] = conv
+    state.mark_dirty(cid)
     log(f"created conversation {cid}")
     return {"conversation_id": cid}
+
+
+@app.get("/api/conversations")
+async def list_conversations() -> Dict[str, Any]:
+    """List every conversation in memory, newest activity first.
+
+    Used by the UI's left-rail / picker after a page reload. Each entry
+    includes a cheap title (first user-text line) and counts so the UI
+    can render without fetching every full conversation.
+    """
+    entries = []
+    for cid, conv in state.conversations.items():
+        title = "(empty conversation)"
+        for m in conv.messages:
+            if m.role != "user":
+                continue
+            for blk in m.display_blocks:
+                if blk.get("kind") == "text" and (blk.get("text") or "").strip():
+                    line = blk["text"].strip().splitlines()[0]
+                    title = line[:60] + ("…" if len(line) > 60 else "")
+                    break
+            if title != "(empty conversation)":
+                break
+        entries.append({
+            "id": cid,
+            "title": title,
+            "created_at": conv.created_at,
+            "updated_at": conv.updated_at,
+            "message_count": len(conv.messages),
+            "asset_count": len(conv.assets),
+        })
+    entries.sort(key=lambda e: e["updated_at"], reverse=True)
+    return {
+        "conversations": entries,
+        "persistence_enabled": state.persistence.enabled,
+    }
+
+
+@app.delete("/api/conversations/{cid}")
+async def delete_conversation(cid: str) -> Dict[str, Any]:
+    """Forget a conversation completely.
+
+    Removes it from RAM and from disk (if persistence is on). Media
+    files in the results / uploads tree are NOT touched; if a follow-up
+    asset list still references them, separate cleanup is needed.
+    """
+    if cid not in state.conversations:
+        raise HTTPException(404, "conversation not found")
+    state.conversations.pop(cid, None)
+    state.persistence.delete(cid)
+    log(f"deleted conversation {cid}")
+    return {"ok": True, "id": cid}
 
 
 @app.get("/api/conversations/{cid}")
@@ -2886,6 +3096,15 @@ async def get_conversation(cid: str) -> Dict[str, Any]:
     conv = state.conversations.get(cid)
     if conv is None:
         raise HTTPException(404, "conversation not found")
+    from webui.tokens import estimate_messages_tokens
+    sys_header = SYSTEM_PROMPT + "\n\n# Current context\n" + _situation_header(conv)
+    used = estimate_messages_tokens(
+        [{"role": "system", "content": sys_header}] + list(conv.oai_messages())
+    )
+    settings = state.orch_settings
+    total = max(2048, int(settings.context_tokens))
+    headroom = max(512, int(settings.max_tokens)) + 1024
+    budget = max(2048, total - headroom)
     return {
         "id": conv.id,
         "messages": [
@@ -2897,6 +3116,11 @@ async def get_conversation(cid: str) -> Dict[str, Any]:
         "assets": [a.public_dict() for a in conv.assets],
         "jobs":   [j.public_dict() for j in conv.jobs.values()],
         "latest_event_seq": conv.events.latest_seq,
+        "context": {
+            "tokens_used": used,
+            "tokens_budget": budget,
+            "tokens_total": total,
+        },
     }
 
 
@@ -3072,13 +3296,16 @@ def _inject_caption_into_message(
     content = msg.oai_message.get("content")
     if isinstance(content, str):
         msg.oai_message["content"] = f"{note}\n\n{content}" if content else note
+        conv._dirty()
     elif isinstance(content, list):
         for block in content:
             if block.get("type") == "text":
                 existing = block.get("text", "")
                 block["text"] = f"{note}\n\n{existing}" if existing else note
+                conv._dirty()
                 return
         content.insert(0, {"type": "text", "text": note})
+        conv._dirty()
 
 
 @app.get("/api/conversations/{cid}/events")
@@ -3167,6 +3394,23 @@ async def list_conversation_assets(cid: str, kind: str = "all", limit: int = 50)
 
 @app.on_event("startup")
 async def warmup() -> None:
+    # Restore any conversations persisted from previous sessions.
+    if state.persistence.enabled:
+        persisted = state.persistence.load_all()
+        loop = asyncio.get_running_loop()
+        for cid, d in persisted.items():
+            try:
+                conv = Conversation.from_dict(d)
+                conv.on_change = state.mark_dirty
+                conv.events.bind_loop(loop)
+                state.conversations[cid] = conv
+            except Exception as e:  # noqa: BLE001
+                log(f"  could not restore conversation {cid}: {e}")
+        if persisted:
+            log(f"restored {len(state.conversations)} conversation(s) from disk")
+        state.persistence.start()
+    else:
+        log("persistence disabled (LANCE_NOPERSIST=1); conversations live in RAM only")
     # Bind the runner's event-loop reference and start its worker thread.
     state.runner.start()
     log("startup: deferring Lance model load until first request")
@@ -3175,3 +3419,12 @@ async def warmup() -> None:
         log(f"orchestrator OK: {state.orch_settings.base_url} model={state.orch_probe.get('model')!r}")
     else:
         log(f"orchestrator UNREACHABLE ({state.orch_settings.base_url}) — falling back to native Lance dispatch. error={state.orch_probe.get('error')}")
+
+
+@app.on_event("shutdown")
+async def cleanup() -> None:
+    # Flush any pending conversation writes before the process dies.
+    try:
+        state.persistence.stop(timeout=2.0)
+    except Exception as e:  # noqa: BLE001
+        log(f"persistence shutdown error: {e}")
