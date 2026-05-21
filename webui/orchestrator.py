@@ -511,8 +511,17 @@ class OrchestratorClient:
                     _dbg(f"stream_chat HTTP {r.status_code} body={body[:400]!r}")
                     raise RuntimeError(f"orchestrator HTTP {r.status_code}: {body[:400]}")
 
+                raw_lines_seen = 0
                 async for raw_line in r.aiter_lines():
                     line = raw_line.strip()
+                    raw_lines_seen += 1
+                    if _debug_enabled():
+                        # Dump every wire line, even keep-alives / non-data
+                        # lines. Critical for first-turn bug diagnosis: we
+                        # need to see whether LM Studio is silently sending
+                        # the tool-call deltas in a format we're filtering.
+                        _dbg(f"stream_chat wire[{raw_lines_seen}] "
+                             f"{line[:500]!r}")
                     if not line or not line.startswith("data:"):
                         continue
                     data = line[len("data:"):].strip()
@@ -526,10 +535,20 @@ class OrchestratorClient:
                         continue
                     choices = evt.get("choices") or []
                     if not choices:
+                        if _debug_enabled():
+                            _dbg(f"stream_chat skip-no-choices keys={list(evt.keys())} "
+                                 f"evt={json.dumps(evt)[:300]!r}")
                         continue
                     choice = choices[0]
                     delta = choice.get("delta") or {}
                     chunks_received += 1
+                    if _debug_enabled():
+                        # The juicy bit — what's in the delta? content,
+                        # tool_calls, role, reasoning, something else?
+                        _dbg(f"stream_chat delta[{chunks_received}] "
+                             f"keys={list(delta.keys())} "
+                             f"finish={choice.get('finish_reason')!r} "
+                             f"delta={json.dumps(delta)[:400]!r}")
                     if "content" in delta and delta["content"]:
                         total_text_chars += len(delta["content"])
                         yield {"type": "text", "delta": delta["content"]}
