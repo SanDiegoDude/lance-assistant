@@ -73,6 +73,15 @@ fi
 
 cd "$REPO_ROOT"
 
+# expandable_segments dramatically reduces allocator fragmentation at the
+# cost of a tiny bit of bookkeeping — useful when a long-running process
+# alternates between large and small allocations (which is exactly what
+# the edit + decode pipeline does). The OOM error message itself recommends
+# this. Only set if the user hasn't picked their own value.
+if [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ]; then
+    export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+fi
+
 echo "================================================================"
 echo "  Lance Assistant"
 echo "  Open  http://${HOST}:${PORT}  (or http://localhost:${PORT})"

@@ -297,12 +297,38 @@ If you have an 80 GB card and want maximum precision:
 export LANCE_DTYPE=float32   # or float16 / bfloat16 (default)
 ```
 
-If you're tight on memory (e.g. other processes already using the
-card), set the standard fragmentation hint:
+`./scripts/run_webui.sh` sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+for you (if you haven't picked your own value), which removes a class
+of fragmentation-driven OOMs on long-running sessions.
 
-```bash
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-```
+The biggest peak-memory savings in the codebase aren't from precision;
+they're from the patches in `webui/server.py:_apply_one_time_patches`:
+
+- The Qwen2.5-VL ViT's SDPA forward upstream builds a dense
+  `[1, seq_length, seq_length]` bool attention mask. At video-edit
+  sequence lengths (~65k tokens) the mask alone is 4 GB and the math
+  kernel SDPA falls back to materializes the same-shape attention
+  scores. We replace that with a per-segment SDPA loop that reads
+  `cu_seqlens` directly, never materializes the mask, and drops peak
+  ViT memory from O(S^2) to O(sum S_i^2).
+- `torch.cuda.empty_cache()` runs before every job to recycle any
+  fragmented allocator blocks the previous job left behind.
+
+If you're still tight on memory on a 24 GB card, the things that move
+the needle next:
+
+- **`--lowvram`** keeps only one of the image / video variants resident
+  at a time (saves ~8 GB at the cost of a hot-swap reload when the
+  task type switches).
+- **Smaller batch / shorter clips for `edit_video`.** The job runner
+  already caps clips at 6 s before they hit Lance's frame sampler.
+- **8-bit / 4-bit weight quantization** of the LLM/ViT (bitsandbytes
+  `Linear8bitLt` or `Linear4bit`) is the obvious next step but isn't
+  wired up yet. On Ada (4090) this would roughly halve the LLM's
+  ~6 GB; the diffusion DiT and the VAE are more sensitive to
+  quantization noise and would need careful evaluation. Worth doing
+  if peak memory is still a problem after the patches above; not
+  worth doing as a first move.
 
 ### Blackwell (sm_121a) compatibility patches
 

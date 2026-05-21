@@ -96,9 +96,9 @@ def _install_decord_shim() -> None:
         """Decord-compatible VideoReader backed by PyAV.
 
         Eagerly decodes the entire clip into an in-memory (T, H, W, 3)
-        uint8 array. That's fine for Lance's edit pipeline — its frame
-        sampler caps clips at 6 seconds and we normalize to 12 FPS, so
-        every clip we hand it is <=72 frames at decode time.
+        uint8 array. We trim clips to <=6s before feeding the edit
+        pipeline (see ``normalize_video_for_edit``), so the backing
+        buffer stays small even at 60 FPS sources.
         """
         def __init__(self, source, ctx=None, num_threads=1, **kwargs):
             import av
@@ -501,6 +501,66 @@ class LancePipeline:
         # modeling_qwen2_5_vl.py, so on a 5.x install every generation route
         # fails with KeyError: 'default'. Re-inject the original 4.x impl —
         # this is verbatim from transformers v4.56.1 modeling_rope_utils.py.
+        # Replace Qwen2_5_VLVisionSdpaAttention.forward with a low-memory
+        # per-segment variant. The upstream SDPA forward builds a dense
+        # ``[1, seq_length, seq_length]`` bool mask, then hands it to SDPA
+        # which falls back to the math kernel (it can't use the cuDNN flash
+        # backend with an arbitrary bool mask). At video-edit seq lengths
+        # (~65k tokens) the mask alone is ~4 GB and the math kernel itself
+        # materializes attention scores of comparable size, so a 24 GB
+        # GPU OOMs before the first block finishes.
+        #
+        # cu_seqlens defines a block-diagonal mask: positions only attend
+        # within their own segment. We honor that by running SDPA per
+        # segment (no mask needed, SDPA picks the flash / mem-efficient
+        # backend, peak memory becomes O(sum S_i^2) instead of O(S^2)).
+        try:
+            from modeling.vit import qwen2_5_vl_vit as _vit
+            import torch.nn.functional as _F
+
+            def _sdpa_per_segment_forward(
+                self,
+                hidden_states,
+                cu_seqlens,
+                rotary_pos_emb=None,
+                position_embeddings=None,
+            ):
+                seq_length = hidden_states.shape[0]
+                q, k, v = (
+                    self.qkv(hidden_states)
+                    .reshape(seq_length, 3, self.num_heads, -1)
+                    .permute(1, 0, 2, 3)
+                    .unbind(0)
+                )
+                if position_embeddings is None:
+                    emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+                    cos = emb.cos().float()
+                    sin = emb.sin().float()
+                else:
+                    cos, sin = position_embeddings
+                q, k = _vit.apply_rotary_pos_emb_vision(q, k, cos, sin)
+
+                cu = cu_seqlens.tolist() if torch.is_tensor(cu_seqlens) else list(cu_seqlens)
+                out_parts = []
+                for i in range(1, len(cu)):
+                    s, e = int(cu[i - 1]), int(cu[i])
+                    if e <= s:
+                        continue
+                    qi = q[s:e].transpose(0, 1)  # (H, S_i, D)
+                    ki = k[s:e].transpose(0, 1)
+                    vi = v[s:e].transpose(0, 1)
+                    oi = _F.scaled_dot_product_attention(qi, ki, vi, dropout_p=0.0)
+                    out_parts.append(oi.transpose(0, 1))  # (S_i, H, D)
+
+                attn_output = torch.cat(out_parts, dim=0).reshape(seq_length, -1)
+                return self.proj(attn_output)
+
+            _vit.Qwen2_5_VLVisionSdpaAttention.forward = _sdpa_per_segment_forward
+            log("  patched Qwen2_5_VLVisionSdpaAttention.forward → per-segment SDPA "
+                "(no dense N^2 mask)")
+        except Exception as e:  # noqa: BLE001
+            log(f"  warning: could not patch ViT SDPA forward: {e}")
+
         try:
             from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
             if "default" not in ROPE_INIT_FUNCTIONS:
@@ -1638,11 +1698,20 @@ class AppState:
         note)`` is forwarded to the diffusion-step hook so the agent can
         report live progress.
 
-        For ``video_edit`` we first normalize the source clip to Lance's
-        expected 12 FPS / <=6 s MP4 — Lance's frame sampler crashes deep
-        in the model on some non-12 FPS clips and the conversion is fast
-        compared to the actual edit job.
+        For ``video_edit`` we first trim long clips and transcode non-MP4
+        sources to plain MP4 so PyAV (and therefore our decord shim) has
+        an easy time decoding.
         """
+        # Reclaim any fragmented allocator pages held over from prior jobs
+        # before we kick off this one. Doesn't free model weights, just
+        # frees cached blocks that the allocator hasn't released to the
+        # driver yet.
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
         if job.lance_task == "text":
             text = self.text.chat(
                 job.prompt, max_new_tokens=int(job.lance_params.get("max_new_tokens", 512))
