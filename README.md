@@ -1,23 +1,25 @@
 # lance-assistant
 
-A chat-style multimodal assistant for **ByteDance Lance**, a 3B unified
-multimodal model that does text-to-image, text-to-video, image / video
-editing, image / video understanding, and text chat — all from a single
-checkpoint. Originally a reverse-engineering project (May 16, 2026) because
-ByteDance posted [the weights](https://huggingface.co/bytedance-research/Lance)
-saying *"code coming soon"* and we got tired of waiting. **Two days later
-they shipped [bytedance/Lance](https://github.com/bytedance/Lance)**, so this
-repo wraps the official inference code in:
+A chat-style multimodal assistant built on **ByteDance Lance**, a 3 B
+unified multimodal model that handles text-to-image, text-to-video,
+image / video editing, image / video understanding, and text chat from
+a single checkpoint.
 
-- a **FastAPI + Preact chat web UI** with streaming tool-call bubbles,
-- an optional **agentic VLM orchestrator layer** (LM Studio / Ollama / vLLM /
-  OpenAI) that gives Lance an actual conversational brain,
+This repo wraps the official ByteDance inference code in:
+
+- a **FastAPI + Preact chat web UI** with streaming responses, async
+  generation jobs, and live progress bubbles,
+- an optional **agentic orchestrator layer** (LM Studio / Ollama / vLLM /
+  OpenAI — any OpenAI-compatible endpoint) that gives Lance a
+  conversational front-end with tool-calling,
+- **hot-swapping** between the two Lance variants (image-focused
+  `lance_3b` and video-focused `lance_3b_video`) so a single chat can
+  produce both crisp-text images and video clips,
 - **auto-downloading weights** on first run,
-- a handful of **CLI shells** for direct one-shot inference,
-- and an `ARCHITECTURE.md` post-mortem of what reverse-engineering got
-  right vs wrong vs the official release.
+- and a handful of CLI shells for direct one-shot inference and weights
+  management.
 
-## TL;DR — just run Lance
+## Quick start
 
 ```bash
 git clone https://github.com/SanDiegoDude/lance-assistant.git
@@ -28,346 +30,174 @@ cp .env.example .env            # optional: configure orchestrator (LM Studio et
 ./scripts/run_webui.sh          # open http://localhost:7861
 ```
 
-On first launch the server auto-downloads ~32 GB of Lance weights from
-Hugging Face into `weights/Lance_hf/` (resumable). After that, model load
-is fast and the UI is ready in ~30 s.
+On first launch the server auto-downloads the Lance weights from
+Hugging Face into `weights/Lance_hf/` (~30 GB per variant, resumable).
+On a 24 GB card add `--lowvram` so the variants hot-swap instead of
+both occupying VRAM (see "Hot-swapping" below).
 
-### How it's organized
+## How it works
 
-**A. Chat-style web UI (recommended)** — all seven Lance tasks in one
-ChatGPT-style chat, optionally **driven by an agentic VLM orchestrator**
-running on your local network (LM Studio / Ollama / vLLM / OpenAI — any
-OpenAI-compatible endpoint). The orchestrator handles conversation,
-reasoning, code-fenced markdown, and visual understanding; Lance is its
-tool for actually producing new pixels.
+### Web UI
 
-The orchestrator chats with the user and emits OpenAI-style function
-calls when it needs new pixels. Lance jobs run **asynchronously** in the
-background — the orchestrator gets back `{job_id, status: queued}` instantly,
-responds with a quick acknowledgement ("Sure, kicking that off — should be
-ready in ~2 min"), and the conversation continues. The image lands in the
-chat whenever Lance finishes; meanwhile the user can keep typing, ask
-follow-up questions, even start *another* job in parallel (they'll queue
-on the GPU).
+A single-page Preact app served by the FastAPI backend. All Lance tasks
+(generation, editing, understanding) run through one ChatGPT-style chat
+optionally driven by an **agentic orchestrator** (a VLM running on your
+own network that handles conversation and decides when to call Lance).
 
-| Tool                                          | What it runs                                | When |
-|---|---|---|
-| `generate_image(prompt, aspect)`              | Lance t2i                                   | ~2 min |
-| `generate_video(prompt, resolution, frames)`  | Lance t2v                                   | 3 min @192p → 26 min @480p |
-| `edit_image(instruction, asset_id?)`          | Lance image_edit on `asset_id` or the most recent image | ~1 min |
-| `edit_video(instruction, asset_id?)`          | Lance video_edit on the most recent video   | slow |
-| `list_jobs(status?)`                          | inspect background generations              | instant |
-| `get_job(job_id)`                             | full status + result of one job             | instant |
-| `list_assets(kind?, limit?)`                  | every image/video tracked in this chat      | instant |
-| `get_asset(asset_id)`                         | one asset's caption / URL / source          | instant |
-| `cancel_job(job_id)`                          | request cancellation (effective for queued) | instant |
+**Generation tools the orchestrator can call**
 
-Image and video **understanding** are handled by the orchestrator VLM
-itself — it can already see whatever you attach, no Lance call needed.
+| Tool                                          | What it runs                                            |
+|---|---|
+| `generate_image(prompt, aspect)`              | Lance t2i                                               |
+| `generate_video(prompt, resolution, frames)`  | Lance t2v                                               |
+| `edit_image(instruction, asset_id?)`          | Lance image_edit on `asset_id` or the most recent image |
+| `edit_video(instruction, asset_id?)`          | Lance video_edit on the most recent video               |
+| `list_jobs(status?)`                          | inspect background generations                          |
+| `get_job(job_id)`                             | live progress + result of one job                       |
+| `list_assets(kind?, limit?)`                  | every image/video tracked in this chat                  |
+| `get_asset(asset_id)`                         | one asset's URL / source / details                      |
+| `cancel_job(job_id)`                          | request cancellation (effective for queued)             |
+
+Image and video **understanding** is handled by the orchestrator VLM
+itself — it can already see whatever you attach.
 
 If the orchestrator is unreachable (LM Studio not running, etc.) the
 UI shows an "orchestrator: offline" pill and falls back to **Lance-native
 dispatch**: the Output: pills (Auto / Text / Image / Video / Understand)
-pick a task directly from your prompt and attachment. Lance-native mode
-also uses the async job queue, so the UX is consistent.
+pick a task directly from your prompt + attachment.
 
-### How the realtime UI stays alive across long jobs
+### Async generation jobs
+
+Generation runs **asynchronously** in the background. When the
+orchestrator calls a tool it gets back `{job_id, status: "queued"}`
+instantly and continues the conversation. The result lands in the chat
+whenever Lance finishes; meanwhile the user can keep typing, ask
+follow-up questions, even start another job in parallel.
 
 Each conversation has a **persistent SSE event channel** at
-`/api/conversations/{cid}/events` that the frontend keeps open for the
-session. All events (text deltas, tool calls, job lifecycle, errors)
-flow through that single channel with monotonic sequence numbers. On
-reconnect, the client can pass `?from_seq=N+1` to replay anything
-missed without dropping frames. POST `/messages` is non-blocking — it
-returns `202` immediately and the orchestrator turn runs in the
-background.
+`/api/conversations/{cid}/events`. All events (text deltas, tool calls,
+job lifecycle, per-step progress, errors) flow through that single
+channel with monotonic sequence numbers; reconnect with `?from_seq=N+1`
+to replay anything missed.
 
-**Recommended orchestrator models** (load one in LM Studio):
+While a job is running the server emits `job_progress` events on every
+diffusion step. The UI renders a live progress bar with step count and
+ETA; the orchestrator can call `get_job(job_id)` and read `progress`,
+`elapsed_seconds`, and `eta_seconds` to give the user a dynamic,
+hardware-accurate estimate (no hard-coded "wait 2 min" messages).
 
-- `qwen2.5-vl-7b-instruct`   — excellent at function calling + vision, 5-7 GB Q4
-- `pixtral-12b`              — strong vision, 7-9 GB Q4
-- `mistral-small-3.1-24b`    — best reasoning if you have VRAM
-- `gemma-3-12b-it`           — good vision + tool calls
-- `llama-3.2-11b-vision`     — adequate but weaker at tool calls
+### Hot-swapping image and video variants
 
-The orchestrator MUST support OpenAI-style `tools` / `tool_calls` to
-drive Lance. If it doesn't, you can still use Lance-native dispatch.
+ByteDance ships two fine-tunes of Lance:
 
-**B. CLI shell wrapper** — direct one-shot invocation of the official
-`inference_lance.py`, identical to what ByteDance ships:
+| Variant | Checkpoint dir | Strengths | Weaknesses |
+|---|---|---|---|
+| `image` | `Lance_3B/`       | Crisp in-image text, sharper detail; used for every image benchmark on the project page (GenEVAL, DPG, GEdit) | No video generation/editing |
+| `video` | `Lance_3B_Video/` | Supports `generate_video` / `edit_video` / `x2t_video`                                                         | Image text rendering is noticeably worse — words come out garbled/incoherent |
+
+Pick the mode with `LANCE_MODEL_VARIANT={image,video,auto}` in your `.env`:
+
+- `image` — server locks to image-only. `generate_video` / `edit_video`
+  tool calls are rejected.
+- `video` — server locks to video-only (the video checkpoint can also
+  do image gen, with worse text fidelity).
+- `auto` (default) — **both** variants available. The server starts on
+  whichever checkpoint is already on disk (prefers image for fresh
+  installs) and loads the other one lazily the first time a task needs
+  it. Image gen/edit always use the image variant; video gen/edit
+  always use the video variant.
+
+In `auto` mode the server keeps both variants in VRAM by default — fine
+on big-VRAM hardware (40 GB+) but it won't fit on a 24 GB card. Pass
+`--lowvram` (or set `LANCE_LOWVRAM=1`) and the server keeps just one
+variant on the GPU at a time, parking the inactive one in system RAM
+and hot-swapping when the task changes:
 
 ```bash
-./scripts/run_official.sh t2i   # 768x768 image, ~2 min on a single H100/GB10
-./scripts/run_official.sh t2v   # 832x480 / 81f / 5 sec, ~26 min
+./scripts/run_webui.sh --lowvram
+# or
+LANCE_LOWVRAM=1 ./scripts/run_webui.sh
+```
+
+A swap moves ~6-8 GB between system RAM and VRAM, so on a 4090 with
+DDR5 system RAM it adds ~2-3 s the first time you flip between image
+and video tasks. After that the bundle stays cached in CPU RAM, so all
+later swaps are the same ~2-3 s with no re-download or re-init from
+disk.
+
+You can pre-fetch both checkpoints up front (otherwise the second one
+downloads lazily the first time it's needed):
+
+```bash
+python -m lance download --group image  # ~30 GB → weights/Lance_hf/Lance_3B/
+python -m lance download --group video  # ~30 GB → weights/Lance_hf/Lance_3B_Video/
+```
+
+### Orchestrator
+
+The agentic layer is optional but recommended. It's any
+OpenAI-compatible chat-completions endpoint that supports the standard
+`tools` / `tool_calls` function-calling protocol.
+
+Configure in `.env`:
+
+```bash
+ORCHESTRATOR_BASE_URL=http://localhost:1234/v1
+ORCHESTRATOR_API_KEY=                       # blank for LM Studio / Ollama
+ORCHESTRATOR_MODEL=                         # blank = auto-pick first loaded
+```
+
+**Recommended local models** (load one in LM Studio):
+
+- `qwen2.5-vl-7b-instruct` — excellent at function calling + vision, 5-7 GB Q4
+- `pixtral-12b` — strong vision, 7-9 GB Q4
+- `mistral-small-3.1-24b` — best reasoning if you have VRAM
+- `gemma-3-12b-it` — good vision + tool calls
+- `llama-3.2-11b-vision` — adequate but weaker at tool calls
+
+If your orchestrator is itself a vision-language model, set
+`ORCHESTRATOR_EMBED_TOOL_IMAGES=on` and the server will feed generated
+images back to it as `image_url` blocks so it can reason about its own
+output ("the butterfly came out a bit blurry — want me to redo it?").
+
+If the orchestrator is unreachable, Lance-native dispatch kicks in as
+the fallback. Output: pills pick the task directly.
+
+### Direct CLI
+
+For one-shot inference without the web UI:
+
+```bash
+./scripts/run_official.sh t2i           # 768x768 image
+./scripts/run_official.sh t2v           # 832x480 / 81 frames / ~5 s clip
 ./scripts/run_official.sh image_edit
 ./scripts/run_official.sh video_edit
-./scripts/run_official.sh x2t_image   # image understanding
-./scripts/run_official.sh x2t_video   # video understanding
+./scripts/run_official.sh x2t_image     # image understanding
+./scripts/run_official.sh x2t_video     # video understanding
 
 # Outputs land in refs/lance_official/results/<task>_sample_*/
 # Edit refs/lance_official/config/examples/*.json to change the prompts.
 ```
 
-The official Lance code vendors Qwen2 and Qwen2.5-VL forks locally so it
-doesn't depend on HF internals and runs cleanly under either the official
-pins (torch 2.5.1+cu124 / transformers 4.49 / flash-attn 2.6.3, ~Hopper
-and older) or our newer Blackwell-friendly stack (torch 2.9+cu128 /
-transformers 4.56 / flash-attn 2.8.3). The only patch needed was a soft import of
-`decord` in `refs/lance_official/data/datasets_custom/validation_dataset.py`
-(Python 3.12 has no `decord` wheel; T2I and T2V don't need it anyway — only
-the video-editing / video-understanding tasks do). Heads-up: their pinned
-torch+cu124 stack will *not* work on Blackwell (sm_121) — you need cu128+.
-
-Sample outputs in `out/` (all generated on a single GB10 with our env):
-
-| File | Task | Notes |
-|---|---|---|
-| `out/webui_t2i_corgi_768.png`            | T2I via web UI, 768x768          | "corgi in a sunlit meadow, golden hour" |
-| `out/webui_image_edit_corgi_night.png`   | image_edit via web UI            | same corgi, "change to a moonlit night with stars" — note the identity is preserved across the edit |
-| `out/webui_t2v_balloon_192p_13f.mp4`     | T2V via web UI, 192p / 13 frames | fast smoke-test render, ~41 sec |
-| `out/official_t2i_girl_768.png`          | T2I, 768x768, 30 steps, CFG 4    | the prompt-0 girl-with-piano portrait from `t2i_example.json` |
-| `out/official_t2i_cat_stop_sign.png`     | T2I, 768x768                     | rainbow STOP-sign cat (prompt 1) — text rendering works |
-| `out/official_t2i_rainbow_fox.png`       | T2I, 768x768                     | anthropomorphic rainbow fox (prompt 2) |
-| `out/official_t2v_piano_480p.mp4`        | T2V, 832x480 / 81f / 12 fps      | woman at grand piano, the prompt asks for "begins from a medium view and gradually moves into a close facial framing" and the model **delivers that camera move** |
-| `out/official_t2v_unicorn_480p.mp4`      | T2V, 832x480 / 81f / 12 fps      | pastel unicorn in cloud valley |
-| `out/scratch_t2i_mountain_512.png`       | T2I via our scratch impl         | for posterity — our hand-rolled flow_match.py |
-
-Timings on a single GB10: T2I ≈ 2 min / image at 768², T2V ≈ 26 min / clip
-at 832x480 / 81f / 30 steps. (Most of that is the LLM forward on the 33K
-latent-token sequence.)
-
-## Status
-
-| Pathway                  | Our scratch impl | Official code |
-|---|---|---|
-| Text chat + image VQA    | ✅ works (`scripts/chat_text.py`, `scripts/chat_image.py`) | ✅ works (`--task x2t_image` / `x2t_video`) |
-| Text-to-image (T2I)      | ✅ works at 512x512 (`scripts/t2i.py`)                   | ✅ works at 768x768 (`--task t2i`) |
-| Text-to-video (T2V)      | ❌ mode collapse / drift                                  | ✅ works at 480p / 832x480 / 81f (`--task t2v`) |
-| Image editing            | ❌ not implemented                                        | ✅ `--task image_edit` |
-| Multi-turn editing       | ❌ not implemented                                        | ✅ (built into image_edit dataset) |
-| Video editing            | ❌ not implemented                                        | ✅ `--task video_edit` |
-
-The "scratch impl" stuff stays in this repo as a learning artifact and
-because the understanding pathway + T2I work cleanly on top of plain HF
-transformers (no `flex_attention` / `flash_attn_varlen_func` required).
-
-## What we got right (and wrong) reverse-engineering
-
-Reverse-engineering from safetensors keys before they published code, we
-got most of it right but missed two things that matter a lot for video:
-
-**Right ✅**
-- Backbone is Qwen 2.5-VL 3B (36 layers, hidden 2048, GQA 16/2, head_dim
-  128). Per-head QK-norm (Qwen3-style RMSNorm before RoPE) is present —
-  HF's stock `Qwen2_5_VLAttention` doesn't have it, so loading Lance into
-  vanilla HF silently drops 72 RMSNorm weights and outputs gibberish. We
-  patched it in [`src/lance/qknorm_patch.py`](src/lance/qknorm_patch.py).
-- Dual-expert MoT: each transformer layer has two parallel weight sets, one
-  for understanding tokens (text + ViT features) and one with `_moe_gen`
-  suffix for generation tokens (VAE latents). Attention is shared, MLP and
-  layernorms are not.
-- Wan 2.2 VAE (48 latent channels, 4× temporal / 16× spatial compression)
-  for generation, Qwen 2.5-VL ViT (14² spatial × 2 temporal patch) for
-  understanding.
-- MaPE positional bank `[126976, 2048]` for video = `31 latent frames × 64²`
-  (max grid). Indexing `id = t*64² + h*64 + w` matches BAGEL's
-  `get_flattened_position_ids_extrapolate` (also confirmed in official
-  `data/data_utils.py::get_flattened_position_ids_extrapolate_video`).
-  Surprise: official code actually keeps this bank as a **3D sin-cos
-  embedding initialized once and frozen** (`requires_grad=False`) — the
-  values just happen to live in the checkpoint.
-- `time_embedder.mlp: 256 → 2048 → 2048` is a stock DiT-style timestep
-  embedder added to every latent token before the LLM.
-- CFG with both interval `(0.4, 1.0)` and global renorm (clamp `[min, 1]`)
-  to keep flow-matching trajectories stable at low t.
-
-**Wrong / missed ❌**
-- *RoPE is mrope, not 1D RoPE.* We used plain 1D RoPE with all latents
-  sharing the first vision-pad position. Lance actually uses Qwen 2.5-VL's
-  **multimodal rotary position embedding** with `mrope_section=(16,24,24)`
-  splitting head_dim across (t, h, w) axes. For images it doesn't matter
-  much (T_lat=1, our shared-position scheme accidentally produces sane
-  output). For video, this is fatal — without proper temporal mrope
-  coordinates the model has no way to differentiate frames in the
-  rotation, so it either mode-collapses or drifts.
-- *Latent block gets a position shift.* `pos_shift ≈ 1000` is applied to
-  the latents so they sit at high RoPE positions away from text. We had
-  them sitting at position 0 (the first vision-pad index).
-- *"Generalized 3D causal attention"* (paper's phrase) is just **standard
-  causal text + bidirectional within the latent noise block**, implemented
-  via `data/data_utils.py::create_sparse_mask` (flex-attention). My
-  elaborate hand-rolled `build_3d_causal_mask` was misreading the paper.
-- *Default video resolution is 480p (832×480), not 256².* And 81 frames
-  (5 sec @ 16 fps), not 49.
-
-## What's in this repo
-
-```
-notes/ARCHITECTURE.md        post-mortem of the safetensors-key map and
-                             what we got right / wrong
-refs/lance_official/         git clone --depth 1 of bytedance/Lance
-refs/wan22/                  Wan 2.2 reference (for the VAE)
-refs/bagel/                  BAGEL reference (similar architecture)
-.env / .env.example          orchestrator config (LM Studio host, key, model)
-webui/
-  server.py                  FastAPI server: singleton Lance pipeline,
-                             conversation state, agentic + native runners,
-                             /api/conversations endpoint with SSE streaming
-  orchestrator.py            OpenAI-compatible client (httpx) + Lance tool
-                             schemas + system prompt
-  static/index.html          Preact + HTM + Tailwind + marked.js chat UI
-                             (single file, no build step)
-  tmp/                       uploads, request JSONs, generated media
-                             (gitignored)
-scripts/
-  run_webui.sh               launch the chat UI (recommended)
-  run_official.sh            wrapper for refs/lance_official inference_lance.sh
-  fetch_configs.py           pull just the json/tokenizer files (~1 MB)
-  inspect_safetensors_remote.py  HTTP-range reader for safetensors headers
-  chat_text.py               text-only chat demo (HF Qwen2.5-VL + qknorm)
-  chat_image.py              image VQA demo
-  t2i.py                     our scratch T2I (works at 512²; for posterity)
-  t2v.py                     our scratch T2V (broken; left as learning trail)
-src/lance/
-  download.py                hf_hub_download CLI for the weights
-  verify.py                  structural checker
-  extract_understanding.py   Lance→HF Qwen2.5-VL state-dict remap
-  qknorm_patch.py            the QK-norm monkey-patch for HF transformers
-  lance_model.py             scratch MoT implementation (incomplete; mrope
-                             missing, see post-mortem)
-  flow_match.py              scratch T2I/T2V loop (T2I works at 512²)
-  wan_vae.py                 Wan 2.2 VAE encode/decode port
-weights/Lance_hf/            downloaded weights (gitignored)
-out/                         generated samples (gitignored)
-```
-
-### Web UI architecture
-
-Single FastAPI process. Holds:
-
-- The official Lance video model (`lance_3b_video`) loaded once and
-  reused for all media tasks: t2i, t2v, image_edit, video_edit,
-  x2t_image, x2t_video. (No reason to load both image and video
-  checkpoints — the video one is a strict superset.)
-- An `OrchestratorClient` that speaks the OpenAI chat-completions API
-  with streaming + function calling. Talks to whatever VLM you're
-  running on the local network.
-- Our extracted HF understanding ckpt (`weights/lance_3b_understand`)
-  — only used by the *legacy* native-dispatch text path; the
-  orchestrator handles text chat natively when available.
-- Per-conversation state: full chat history, including image data URLs
-  the orchestrator embeds in its context, and the path to the most
-  recent visible image/video so `edit_*` tools know what to target.
-
-Frontend is a single HTML file using Preact + HTM + Tailwind via CDN +
-marked.js + DOMPurify + highlight.js for rendering. No build step.
-
-#### Request flow with orchestrator
-
-```
-   user types "draw me a butterfly"
-       ↓
-   POST /api/conversations/{id}/messages
-       ↓
-   Server: append user msg to conversation
-       ↓
-   OrchestratorClient.stream_chat(history, tools=[generate_image, ...])
-       ↓
-   Orchestrator decides: "I should call generate_image('a butterfly...')"
-       ↓
-   Server receives tool_call, runs Lance pipeline (~2 min)
-       ↓
-   Server emits SSE: tool_start → tool_result with media_url
-       ↓
-   Server adds tool message to conversation with image embedded as
-     data URL (so the orchestrator can see what was produced)
-       ↓
-   OrchestratorClient.stream_chat(history with tool result)
-       ↓
-   Orchestrator responds: "Here's the butterfly you asked for!"
-       ↓
-   Server streams text_delta events
-       ↓
-   Frontend renders markdown bubble, image bubble with download/reuse
-```
-
-#### Request flow without orchestrator (fallback)
-
-```
-   user types "draw me a butterfly", picks "Image" mode pill
-       ↓
-   POST /api/conversations/{id}/messages
-       ↓
-   Server: decide_task(prompt, "image", None) → "t2i"
-       ↓
-   Run Lance pipeline directly
-       ↓
-   Emit tool_start / tool_result events
-       ↓
-   Done. No chat memory between turns.
-```
-
-#### Dispatch (native fallback)
-
-```
-                 │  no mode override   │  user picked mode
-   nothing       │  text chat          │  text / t2i / t2v
-   image attach  │  question? x2t      │  understand / image_edit
-                 │  else  image_edit   │
-   video attach  │  question? x2t      │  understand / video_edit
-                 │  else  video_edit   │
-```
-
-#### Multi-turn editing
-
-In agentic mode this is transparent — the orchestrator remembers the
-previous generation and calls `edit_image(...)` with the right reference.
-In native mode the "↻ Use as input for next message" button on each
-generated bubble re-attaches the file for the next request.
-
-#### Blackwell (sm_121a) workarounds in `webui/server.py`
-
-Three patches the webui applies that the official code doesn't ship,
-all driven by sm_121a being too new for the cu128 / triton 3 PTX
-assembler we have:
-
-1. `vit_config._attn_implementation = "sdpa"` — the default
-   `flash_attention_2` path calls `flash_attn.layers.rotary` whose
-   Triton kernel fails ptxas. SDPA uses cuDNN, works.
-2. `qwen2_navit.flex_attention = <eager flex_attention>` — the official
-   code does `flex_attention = torch.compile(flex_attention)` at module
-   import; Inductor tries to compile the kernel for sm_121a and bails.
-   Reverting to eager flex_attention is slower but actually runs.
-3. `torch._dynamo.config.suppress_errors = True` — belt-and-braces
-   fallback for any other `torch.compile` site that might trip on
-   sm_121a; degrades to eager instead of failing.
-
-Once the cu128 / triton stack catches up to sm_121a these can all go
-away.
-
 ## Setup
 
-For most users the `setup.sh` script at the top is all you need. It
-creates `.venv/`, installs the right torch + flash-attn for your GPU,
-clones the official Lance code, and applies the `decord` soft-import
-patch.
+`./scripts/setup.sh` creates `.venv/`, installs the right
+torch + flash-attn for your GPU arch, clones the official Lance code
+into `refs/lance_official/`, and applies a soft-import patch for
+`decord` (only video editing / video understanding actually needs it,
+and Python 3.12 has no `decord` wheel).
 
-```bash
-./scripts/setup.sh
-```
+The script auto-detects the GPU arch and installs:
 
-The script auto-detects your GPU arch from `nvidia-smi` and picks the
-matching stack:
-
-| GPU                                 | Compute cap | Stack `setup.sh` installs                   |
+| GPU                                 | Compute cap     | Stack `setup.sh` installs                       |
 |---|---|---|
-| 3090 / A100 / A40 (Ampere)          | sm_80 / sm_86 | torch 2.5.1+cu124 + flash-attn 2.7.4.post1 |
-| 4090 / L40 / RTX 6000 Ada (Ada)     | sm_89        | torch 2.5.1+cu124 + flash-attn 2.7.4.post1 |
-| H100 / H200 (Hopper)                | sm_90        | torch 2.5.1+cu124 + flash-attn 2.7.4.post1 |
-| GB10 / DGX Spark / 5090 (Blackwell) | sm_120 / sm_121 | torch 2.9.0+cu128 (no flash-attn — uses SDPA) |
-| CPU-only                            | —            | torch 2.5.1+cpu                              |
+| 3090 / A100 / A40 (Ampere)          | sm_80 / sm_86   | torch 2.5.1+cu124 + flash-attn 2.7.4.post1      |
+| 4090 / L40 / RTX 6000 Ada (Ada)     | sm_89           | torch 2.5.1+cu124 + flash-attn 2.7.4.post1      |
+| H100 / H200 (Hopper)                | sm_90           | torch 2.5.1+cu124 + flash-attn 2.7.4.post1      |
+| GB10 / DGX Spark / 5090 (Blackwell) | sm_120 / sm_121 | torch 2.9.0+cu128 (no flash-attn — uses SDPA)   |
+| CPU-only                            | —               | torch 2.5.1+cpu                                 |
 
-Override via env var if auto-detection picks the wrong stack:
+Override with env vars when needed:
 
 ```bash
 GPU_DEPS=cu124 ./scripts/setup.sh      # force Ampere/Ada/Hopper stack
@@ -378,48 +208,47 @@ GPU_DEPS=skip  ./scripts/setup.sh      # bring your own torch / flash-attn
 FLASH_ATTN_SKIP=1 ./scripts/setup.sh   # install torch, skip flash-attn (SDPA-only)
 ```
 
-If you'd rather wire it into an existing env, set `SKIP_VENV=1`. You can
-also point `PYTHON=/path/to/python` to a specific interpreter when
+If you'd rather wire it into an existing env, set `SKIP_VENV=1`. You
+can also point `PYTHON=/path/to/python` to a specific interpreter when
 creating the venv.
 
 ### Troubleshooting `flash-attn`
 
-flash-attn is the #1 source of setup pain across every project that uses
-it. `setup.sh` handles the common case, but if it fails or you're
-installing manually, here's what's going on:
+flash-attn is the #1 source of setup pain. `setup.sh` handles the
+common case, but if it fails or you're installing manually:
 
 1. **`ModuleNotFoundError: No module named 'torch'` during the build.**
-   This is pip's default *build isolation* creating a clean env without
-   torch, which flash-attn's `setup.py` imports. Always use:
+   pip's default *build isolation* creates a clean env without torch,
+   which flash-attn's `setup.py` imports. Always:
    ```bash
    pip install flash-attn==... --no-build-isolation
    ```
 
 2. **`pip` starts compiling instead of downloading a wheel.**
-   Compilation needs nvcc and takes 30+ min. Prebuilt wheels exist on
+   Compilation needs `nvcc` and takes 30+ min. Prebuilt wheels exist on
    the [Dao-AILab releases page](https://github.com/Dao-AILab/flash-attention/releases)
-   for **specific** torch + cuda + python combos. If yours doesn't
-   match, pip falls back to source build. Fix by pinning torch to a
-   version with wheel coverage:
+   for **specific** torch + cuda + python combinations. If yours
+   doesn't match, pip falls back to source build. Fix by pinning torch
+   to a version with wheel coverage:
    ```bash
    pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
    pip install flash-attn==2.7.4.post1 --no-build-isolation
    ```
 
 3. **`packaging` / `ninja` not found.**
-   flash-attn's build script imports them. Always:
+   flash-attn's build script imports them:
    ```bash
    pip install --upgrade pip wheel packaging ninja
    ```
    *before* installing flash-attn.
 
 4. **Blackwell (sm_120 / sm_121) won't build flash-attn.**
-   No prebuilt wheels exist yet and source builds frequently fail. The
+   No prebuilt wheels yet and source builds frequently fail. The
    server falls back to SDPA + a monkey-patched `flex_attention` and
-   runs fine without flash-attn — just install it with
+   runs fine without flash-attn — just install with
    `FLASH_ATTN_SKIP=1 ./scripts/setup.sh`.
 
-5. **Already installed wrong torch? Reinstall:**
+5. **Already installed the wrong torch?** Reinstall:
    ```bash
    .venv/bin/pip uninstall -y torch torchvision torchaudio flash-attn
    .venv/bin/pip install torch==2.5.1 torchvision torchaudio \
@@ -427,85 +256,57 @@ installing manually, here's what's going on:
    .venv/bin/pip install flash-attn==2.7.4.post1 --no-build-isolation
    ```
 
-### VRAM / precision
+### VRAM and precision
 
-By default the server loads Lance in **bf16** (~8 GB on a 24 GB card —
-LLM ~6 GB + ViT ~1.4 GB + VAE ~0.6 GB). The official ByteDance inference
-moves the model to GPU in fp32 first and only casts afterwards, which
-needs ~16 GB just for the move and OOMs a 4090. Our server collapses
-that into a single bf16 move.
+By default the server loads Lance in **bf16**: roughly 8 GB per variant
+(LLM ~6 GB + ViT ~1.4 GB + VAE ~0.6 GB). The official ByteDance
+inference path moves the model to GPU in fp32 first and casts only
+afterwards, which needs ~16 GB just for the move and OOMs a 24 GB
+card. The webui collapses that into a single bf16 move.
 
 If you have an 80 GB card and want maximum precision:
+
 ```bash
 export LANCE_DTYPE=float32   # or float16 / bfloat16 (default)
 ```
 
-If you're still tight on memory (e.g. background processes already using
-the card), set the standard fragmentation hint:
+If you're tight on memory (e.g. other processes already using the
+card), set the standard fragmentation hint:
+
 ```bash
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
 
-### Picking the right model variant (and hot-swapping)
+### Blackwell (sm_121a) compatibility patches
 
-ByteDance ships **two** fine-tunes of Lance:
+The webui applies three runtime patches that the official ByteDance
+code doesn't ship, all required because the cu128 / Triton stack
+doesn't yet emit valid PTX for sm_121a:
 
-| Variant | Checkpoint dir | Strengths | Weaknesses |
-|---|---|---|---|
-| `image` | `Lance_3B/` | Crisp in-image text, sharper detail; used for every image benchmark on the project page (GenEVAL, DPG, GEdit) | No video generation/editing |
-| `video` | `Lance_3B_Video/` | Supports `generate_video` / `edit_video` / `x2t_video` | Image text rendering is noticeably worse — words come out garbled/incoherent |
+1. `vit_config._attn_implementation = "sdpa"` — the default
+   `flash_attention_2` path inside Qwen2.5-VL ViT calls
+   `flash_attn.layers.rotary` whose Triton kernel fails `ptxas`. SDPA
+   uses cuDNN, works fine.
+2. `qwen2_navit.flex_attention = <eager flex_attention>` — the official
+   code wraps `flex_attention` in `torch.compile` at module import;
+   Inductor tries to compile for sm_121a and bails. Reverting to the
+   eager version is slower but actually runs.
+3. `torch._dynamo.config.suppress_errors = True` — belt-and-braces
+   fallback for any other `torch.compile` site that might trip on
+   sm_121a; degrades to eager instead of failing.
 
-Pick the mode with `LANCE_MODEL_VARIANT={image,video,auto}` in your `.env`:
-
-- `image` — server locks to image-only (`generate_image`, `edit_image`,
-  `x2t_image`). Video tool calls are rejected.
-- `video` — server locks to video-only (the video checkpoint also covers
-  image gen, with worse text fidelity).
-- `auto` (default) — **both** variants available. The server starts on
-  whichever is already on disk (prefers image for fresh installs) and
-  loads the other one lazily the first time you ask for a task that
-  needs it. Inside a chat, image tasks use the image variant and video
-  tasks use the video variant — best of both worlds.
-
-### Hot-swapping for 24 GB cards (`--lowvram`)
-
-In `auto` mode the server keeps both variants in VRAM by default — fine
-on big-VRAM hardware (40 GB+) but it won't fit on a 4090. Pass
-`--lowvram` (or set `LANCE_LOWVRAM=1`) and the server will keep just one
-variant on the GPU at a time, parking the inactive one in system RAM and
-hot-swapping when the task changes:
-
-```bash
-./scripts/run_webui.sh --lowvram
-# or
-LANCE_LOWVRAM=1 ./scripts/run_webui.sh
-```
-
-A swap moves ~6-8 GB between system RAM and VRAM, so on a 4090 with
-DDR5 system RAM it adds ~2-3 s the first time you flip from images to
-video (and back). After that the bundle stays cached in CPU RAM, so the
-swap-back is the same ~2-3 s and there's no re-download or re-init from
-disk. If you've got a slower machine — or you genuinely only need one
-variant — set `LANCE_MODEL_VARIANT=image` or `=video` and skip the swap
-machinery entirely.
-
-You can also pre-fetch both checkpoints up front (otherwise the second
-one downloads lazily the first time it's needed):
-```bash
-python -m lance download --group image  # ~30 GB → weights/Lance_hf/Lance_3B/
-python -m lance download --group video  # ~30 GB → weights/Lance_hf/Lance_3B_Video/
-```
+Once cu128 / Triton catch up to sm_121a these will all go away.
 
 ## Fetching weights
 
-The web UI **auto-downloads** weights on first launch (`group=video`,
-~32 GB). If you want to pre-fetch or grab a different subset:
+The web UI auto-downloads weights on first launch. To pre-fetch or
+grab a subset manually:
 
 ```bash
 # Configs + tokenizers only (~1 MB) — enough to inspect the architecture
 python -m lance download --group small
 
-# Image-only: Lance_3B + Qwen2.5-VL ViT + Wan2.2 VAE  (~28 GB)
+# Image-only: Lance_3B + Qwen2.5-VL ViT + Wan2.2 VAE  (~30 GB)
 python -m lance download --group image
 
 # Video-only: Lance_3B_Video + Qwen2.5-VL ViT + Wan2.2 VAE  (~32 GB)
@@ -515,21 +316,20 @@ python -m lance download --group video
 python -m lance download --group all
 ```
 
-All resumable. Structurally verify (parses the safetensors header,
-no torch needed):
+All downloads resume. Verify on-disk integrity (parses the safetensors
+header, no torch required):
 
 ```bash
 python -m lance verify --target weights/Lance_hf
 ```
 
-## Understanding pathway (our HF-compat extractor)
+## Standalone understanding pathway
 
-Pre-dating the official release, we built a vanilla
-`Qwen2_5_VLForConditionalGeneration` extractor for Lance: (1) remap the
-safetensors keys, (2) patch in the missing per-head QK-norms, and you've
-got Lance running through stock HF Transformers for text + VQA. The
-official code is now the recommended path for everything, but if you want
-to play with the extracted standalone understanding head:
+For text + VQA without spinning up the full multimodal pipeline, the
+repo ships a key remapper that produces a vanilla
+`Qwen2_5_VLForConditionalGeneration` checkpoint from Lance's
+safetensors. Useful for hooking Lance into anything that expects a
+stock HF Transformers model.
 
 ```bash
 python -m lance extract_understanding \
@@ -543,23 +343,39 @@ python scripts/chat_text.py --prompt "What is the capital of France?"
 python scripts/chat_image.py --image foo.jpg --prompt "What is shown?"
 ```
 
-### GPU note (sm_121 / GB10)
+The full webui already does understanding through the orchestrator
+VLM or `x2t_image` / `x2t_video` tasks — this extractor is only useful
+if you want a standalone HF checkpoint.
 
-Text inference works fine on GB10. Image VQA on GPU currently hits a
-`torch 2.9 / cu128` NVRTC compile failure for a `prod` reduction kernel
-because sm_121 isn't in cu128's known-arch table. CPU works (~2.7 tok/s).
+## Repository layout
 
-## Roadmap
+```
+refs/lance_official/       git clone of bytedance/Lance (the model code)
+.env / .env.example        configuration: orchestrator endpoint, model variant,
+                           low-vram flag, dtype, port, etc.
+webui/
+  server.py                FastAPI server: variant-aware Lance pipeline,
+                           async job runner, SSE event bus, conversation state
+  orchestrator.py          OpenAI-compatible client + Lance tool schemas
+                           + system prompt
+  jobs.py                  JobRecord / EventBus / JobRunner
+  static/index.html        Preact + HTM + Tailwind chat UI (single file)
+  tmp/                     uploads, request JSONs, generated media (gitignored)
+scripts/
+  run_webui.sh             launch the chat UI (recommended)
+  run_official.sh          wrapper for direct one-shot CLI inference
+  setup.sh                 GPU-arch-aware installer
+src/lance/
+  download.py              hf_hub_download CLI for the weights
+  verify.py                structural checker (safetensors header parser)
+  extract_understanding.py Lance → HF Qwen2.5-VL state-dict remap
+weights/Lance_hf/          downloaded weights (gitignored)
+```
 
-- [x] Map architecture from safetensors keys (pre-code-release)
-- [x] Project scaffold + downloader + structural verifier
-- [x] State-dict extractor (Lance → HF Qwen2.5-VL key remap)
-- [x] QK-norm monkey-patch
-- [x] **Milestone 1**: text chat + image VQA on the understanding pathway
-- [x] Wan 2.2 VAE encode/decode port (scratch)
-- [x] `LanceForGeneration` scratch MoT implementation (no mrope)
-- [x] **Milestone 2**: scratch T2I at 512² (good quality)
-- [~] Milestone 3: scratch T2V — **abandoned** (needs mrope + pos_shift +
-      flex-attention sparse mask; the official code already has all of it)
-- [x] **Milestone 4 (the real one)**: integrate official `bytedance/Lance`
-      as the primary inference path with our weights layout
+## License
+
+The Lance model itself is released by ByteDance Research under their
+own terms — see
+[bytedance-research/Lance](https://huggingface.co/bytedance-research/Lance)
+and [bytedance/Lance](https://github.com/bytedance/Lance). This wrapper
+is provided as-is, no warranty.

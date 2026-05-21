@@ -134,14 +134,14 @@
       x2t_video:  "Watching video…",
     };
     const TOOL_HINT = {
-      generate_image: "~2 min on a single H100/GB10 at 768²",
-      generate_video: "Video gen is slow — 192p ≈ 3 min, 360p ≈ 8 min, 480p ≈ 26 min",
-      edit_image:     "~1 min — identity preserved through the edit",
-      edit_video:     "Video edit is slow (similar timing to T2V)",
-      t2i: "~2 min at 768²",
-      t2v: "Slow: 192p≈3min, 480p≈26min",
-      image_edit: "~1 min",
-      video_edit: "Slow",
+      generate_image: "Image generation — text-to-image at 768²",
+      generate_video: "Video generation — slower than images; scales with resolution and frame count",
+      edit_image:     "Image edit — preserves identity through the change",
+      edit_video:     "Video edit — slow (similar cost to video generation)",
+      t2i: "Image generation at 768²",
+      t2v: "Video generation — slow; scales with resolution and frame count",
+      image_edit: "Image edit — preserves identity",
+      video_edit: "Video edit — slow",
     };
 
     function MediaBlock({ kind, url, filename, onUseAsInput }) {
@@ -220,6 +220,9 @@
           </div>`;
       }
 
+      const pct = (b.progress != null) ? Math.round(b.progress * 100) : null;
+      const showProgress = status === "running" && b.total_steps && b.total_steps > 0;
+
       return html`
         <div class=${"rounded-xl border " + statusColor + " p-2.5 space-y-1.5"}>
           <div class="flex items-center gap-2 text-[11px] uppercase tracking-wider text-txt-2">
@@ -236,7 +239,10 @@
               ${label}
             </span>
             ${elapsed != null ? html`<span>· ${formatElapsed(elapsed)}</span>` : null}
-            ${hint && (status === "queued" || status === "running") ? html`<span class="text-txt-2 hidden md:inline">· ${hint}</span>` : null}
+            ${showProgress ? html`<span>· step ${b.step}/${b.total_steps}</span>` : null}
+            ${showProgress && b.eta_seconds != null && b.eta_seconds > 0 ? html`
+              <span>· ~${formatElapsed(b.eta_seconds)} left</span>` : null}
+            ${hint && (status === "queued" || status === "running") && !showProgress ? html`<span class="text-txt-2 hidden md:inline">· ${hint}</span>` : null}
             ${b.job_id ? html`<span class="font-mono text-[10px] ml-auto text-txt-2">${b.job_id.slice(0, 10)}</span>` : null}
             ${(status === "queued" || status === "running") && b.job_id && onCancelJob ? html`
               <button onClick=${() => onCancelJob(b.job_id)}
@@ -244,6 +250,10 @@
                 cancel
               </button>` : null}
           </div>
+          ${showProgress ? html`
+            <div class="h-1 bg-bg-3 rounded overflow-hidden">
+              <div class="h-full bg-info transition-all" style=${`width: ${pct}%`}></div>
+            </div>` : null}
           ${b.args && (b.args.prompt || b.args.instruction) ? html`
             <div class="text-xs text-txt-1 italic">"${b.args.prompt || b.args.instruction}"</div>` : null}
           ${b.error ? html`
@@ -421,6 +431,26 @@
             status: "running",
             startedAt: Date.now(),
             elapsed: 0,
+          });
+        } else if (type === "job_progress") {
+          // Live denoising-step progress from the server's forward hook.
+          setActiveJobs(prev => ({
+            ...prev,
+            [payload.job_id]: {
+              ...(prev[payload.job_id] || {}),
+              progress: payload.progress,
+              progress_note: payload.progress_note,
+              step: payload.step,
+              total_steps: payload.total_steps,
+              eta_seconds: payload.eta_seconds,
+            },
+          }));
+          upsertJobBlock(payload.job_id, {
+            progress: payload.progress,
+            progress_note: payload.progress_note,
+            step: payload.step,
+            total_steps: payload.total_steps,
+            eta_seconds: payload.eta_seconds,
           });
         } else if (type === "job_completed") {
           setActiveJobs(prev => {

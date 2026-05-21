@@ -280,6 +280,12 @@ class LancePipeline:
         self.base_data_args = None
         self.base_inference_args = None
         self.variant: str = "image"   # mirrors active_variant for legacy callers
+        # Progress-reporting state, set per-run by run(progress_callback=…).
+        # The forward pre-hook installed on time_embedder reads these.
+        self._progress_callback = None
+        self._progress_step = 0
+        self._progress_total = 0
+        self._progress_hooked_variants: set = set()
 
     # ---- public init flow -----------------------------------------------
 
@@ -744,6 +750,47 @@ class LancePipeline:
         log(f"  hot-swap → variant={variant!r} on CPU in "
             f"{time.perf_counter() - t0:.1f}s")
 
+    def _install_progress_hook(self) -> None:
+        """Wire a forward pre-hook on the active variant's ``time_embedder``
+        so each denoising step bumps the progress counter and notifies the
+        callback (if any). Hooks are persistent per variant and idempotent
+        (we register only the first time we see a given variant).
+
+        Why ``time_embedder``? Lance's inference loop calls
+        ``self.time_embedder(timestep)`` exactly once at the top of every
+        denoising step (modeling/lance/lance.py:647 and friends). Other
+        forward paths (CFG cond/uncond LLM passes) don't go through
+        ``time_embedder``, so we get one tick per step, no double-counting.
+        Tasks without a denoising loop (x2t_* understanding) never call it,
+        so the counter stays at 0 and we never emit spurious progress.
+        """
+        variant = self.active_variant
+        if variant in self._progress_hooked_variants:
+            return
+        bundle = self.bundles[variant]
+        if not hasattr(bundle.model, "time_embedder"):
+            return  # safety net — shouldn't happen for visual_gen=True
+
+        def _hook(_module, _args, _kwargs=None):
+            try:
+                if self._progress_callback is None or self._progress_total <= 0:
+                    return
+                self._progress_step += 1
+                step = self._progress_step
+                total = self._progress_total
+                # Clamp — the loop sometimes makes a final "step N+1" call
+                # for the final refinement pass; we don't want to report
+                # 51/50 to the agent.
+                if step > total:
+                    step = total
+                self._progress_callback(step, total, "")
+            except Exception:  # noqa: BLE001
+                # Hooks must not raise — we'd kill the diffusion loop.
+                pass
+
+        bundle.model.time_embedder.register_forward_pre_hook(_hook)
+        self._progress_hooked_variants.add(variant)
+
     def _point_mirror_at(self, variant: str) -> None:
         """Update the legacy ``self.model`` / ``self.tokenizer`` / …
         mirror fields to point at ``variant``'s bundle. Called whenever
@@ -766,12 +813,17 @@ class LancePipeline:
 
     # ---------------------------------------------------------------- run --
 
-    def run(self, job: Job) -> Dict[str, Any]:
+    def run(self, job: Job, progress_callback=None) -> Dict[str, Any]:
         """Dispatch a job to the right task. Blocks until done (or raises).
 
         Hot-swaps the model variant if the task requires one that isn't
         currently active (see :meth:`_activate_variant`). Returns the
         public result dict that we store on `job.result`.
+
+        ``progress_callback(step, total_steps, note)`` is invoked once per
+        denoising step for tasks that have one (t2i / t2v / *_edit). x2t
+        tasks don't iterate timesteps so the callback never fires for
+        them — the agent should rely on `elapsed_seconds` alone there.
         """
         self.initialize()
 
@@ -792,15 +844,32 @@ class LancePipeline:
                 )
             self._activate_variant(needed)
 
+        # Wire up the per-step progress hook on this variant's
+        # time_embedder. We need to know the total step count up front
+        # so the callback can report progress fractions — pull it from
+        # the per-task default (which the orchestrator can override via
+        # `steps` in job.params).
+        total_steps = int(job.params.get("steps", self.base_inference_args.validation_num_timesteps))
         with self.lock:
             torch.cuda.set_device(self.device)
-            if job.task in ("t2i", "t2v"):
-                return self._run_generation(job)
-            if job.task in ("image_edit", "video_edit"):
-                return self._run_edit(job)
-            if job.task in ("x2t_image", "x2t_video"):
-                return self._run_understanding(job)
-            raise ValueError(f"unknown task for Lance pipeline: {job.task}")
+            self._install_progress_hook()
+            self._progress_callback = progress_callback if progress_callback else None
+            self._progress_step = 0
+            self._progress_total = total_steps if job.task in (
+                "t2i", "t2v", "image_edit", "video_edit"
+            ) else 0
+            try:
+                if job.task in ("t2i", "t2v"):
+                    return self._run_generation(job)
+                if job.task in ("image_edit", "video_edit"):
+                    return self._run_edit(job)
+                if job.task in ("x2t_image", "x2t_video"):
+                    return self._run_understanding(job)
+                raise ValueError(f"unknown task for Lance pipeline: {job.task}")
+            finally:
+                self._progress_callback = None
+                self._progress_step = 0
+                self._progress_total = 0
 
     # ---- common ---------------------------------------------------------
 
@@ -1341,11 +1410,13 @@ class AppState:
 
     # ---- callbacks invoked by JobRunner --------------------------------
 
-    def _lance_execute(self, job: JobRecord) -> Dict[str, Any]:
+    def _lance_execute(self, job: JobRecord, on_progress) -> Dict[str, Any]:
         """Run a single Lance task synchronously inside the worker thread.
 
         Bridges the JobRecord shape used by JobRunner to the legacy `Job`
-        shape that LancePipeline.run() expects.
+        shape that LancePipeline.run() expects. ``on_progress(step, total,
+        note)`` is forwarded to the diffusion-step hook so the agent can
+        report live progress.
         """
         if job.lance_task == "text":
             text = self.text.chat(
@@ -1360,7 +1431,7 @@ class AppState:
             attachment_kind=job.attachment_kind,
             params=dict(job.lance_params),
         )
-        return self.pipeline.run(legacy)
+        return self.pipeline.run(legacy, progress_callback=on_progress)
 
     def _build_asset(self, job: JobRecord, result: Dict[str, Any]) -> Optional[Asset]:
         """Promote a finished media job to an Asset on its conversation."""
@@ -1890,9 +1961,11 @@ async def run_agentic_turn(conv: Conversation) -> None:
                         "message": (
                             f"Job {job.id} ({name}) has been queued. "
                             f"It will run in the background and the result will appear "
-                            f"in the chat automatically when complete (~{_eta_hint(name, args)}). "
-                            f"You can call list_jobs() to check progress, or simply respond to the user "
-                            f"with a brief acknowledgement now — do NOT call this tool again."
+                            f"in the chat automatically when complete. Call "
+                            f"get_job(\"{job.id}\") at any time to get the live "
+                            f"progress, elapsed time, and ETA — do NOT call this "
+                            f"tool again. Respond to the user with a brief "
+                            f"acknowledgement now (no static time estimate)."
                         ),
                     }
                     tool_text = json.dumps(queued_payload)
@@ -2004,13 +2077,28 @@ def _situation_header(conv: Conversation) -> str:
             f"use the image variant (crisp in-image text); video gen/edit use "
             f"the video variant — all tasks are available."
         )
-    active = [j for j in conv.jobs.values() if j.status in ("queued", "running")]
+    active_jobs = [j for j in conv.jobs.values() if j.status in ("queued", "running")]
     done = [j for j in conv.jobs.values() if j.status == "done"]
-    if active:
-        lines.append(f"- {len(active)} job(s) currently {','.join(sorted({j.status for j in active}))}. "
-                     f"Oldest started {_relative_ago(min(j.started_at or j.created_at for j in active))} ago.")
-        for j in active[:4]:
-            lines.append(f"    job {j.id} {j.tool} \"{j.prompt[:80]}\"")
+    if active_jobs:
+        lines.append(f"- {len(active_jobs)} job(s) currently {','.join(sorted({j.status for j in active_jobs}))}. "
+                     f"Oldest started {_relative_ago(min(j.started_at or j.created_at for j in active_jobs))} ago.")
+        for j in active_jobs[:4]:
+            # Build a live-progress fragment from JobRecord state so the
+            # agent can answer "how long" without an extra get_job call.
+            bits: List[str] = []
+            if j.total_steps > 0:
+                bits.append(f"step {j.step}/{j.total_steps}")
+                pct = int(round((j.progress or 0.0) * 100))
+                if pct > 0:
+                    bits.append(f"{pct}%")
+            elapsed = j._elapsed() if hasattr(j, "_elapsed") else None
+            if elapsed is not None and elapsed > 0:
+                bits.append(f"elapsed {int(elapsed)}s")
+            eta = j._eta_seconds() if hasattr(j, "_eta_seconds") else None
+            if eta is not None and eta > 0:
+                bits.append(f"~{int(eta)}s remaining")
+            tail = f"  [{', '.join(bits)}]" if bits else ""
+            lines.append(f"    job {j.id} {j.tool} \"{j.prompt[:80]}\"{tail}")
     if conv.assets:
         kinds = {}
         for a in conv.assets:
@@ -2027,16 +2115,6 @@ def _relative_ago(ts: float) -> str:
     if s < 60: return f"{int(s)}s"
     if s < 3600: return f"{int(s/60)}m"
     return f"{int(s/3600)}h"
-
-
-def _eta_hint(tool: str, args: Dict[str, Any]) -> str:
-    if tool == "generate_image": return "2 min"
-    if tool == "edit_image":     return "1 min"
-    if tool == "edit_video":     return "26 min"
-    if tool == "generate_video":
-        res = args.get("resolution", "192p")
-        return {"192p": "3 min", "360p": "8 min", "480p": "26 min"}.get(res, "5 min")
-    return "a moment"
 
 
 # ---------------------------------------------------------------------------

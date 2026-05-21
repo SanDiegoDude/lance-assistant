@@ -110,6 +110,11 @@ class JobRecord:
     status: str = "queued"          # queued | running | done | failed | cancelled
     progress: float = 0.0
     progress_note: str = ""
+    # Live progress reporting (populated by the executor via on_progress callback).
+    # `step` / `total_steps` come from the diffusion loop (NaN-equivalent 0 means
+    # not yet started, or a task that doesn't have a denoising loop like x2t).
+    step: int = 0
+    total_steps: int = 0
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     created_at: float = field(default_factory=time.time)
@@ -119,11 +124,27 @@ class JobRecord:
     asset_id: Optional[str] = None           # filled when result is media
     cancel_requested: bool = False
 
+    def _elapsed(self) -> Optional[float]:
+        if self.started_at is None:
+            return None
+        end = self.finished_at if self.finished_at is not None else time.time()
+        return end - self.started_at
+
+    def _eta_seconds(self) -> Optional[float]:
+        """Linear extrapolation from elapsed step time. Only meaningful
+        while running with at least one step recorded; otherwise None.
+        """
+        if self.status != "running":
+            return None
+        elapsed = self._elapsed()
+        if elapsed is None or self.step <= 0 or self.total_steps <= 0:
+            return None
+        if self.step >= self.total_steps:
+            return 0.0
+        # Assume per-step time is constant; remaining = elapsed * (total/step - 1).
+        return max(0.0, elapsed * (self.total_steps - self.step) / float(self.step))
+
     def public_dict(self) -> Dict[str, Any]:
-        elapsed = None
-        if self.started_at is not None:
-            end = self.finished_at if self.finished_at is not None else time.time()
-            elapsed = end - self.started_at
         return {
             "id": self.id,
             "conversation_id": self.conversation_id,
@@ -134,13 +155,16 @@ class JobRecord:
             "status": self.status,
             "progress": self.progress,
             "progress_note": self.progress_note,
+            "step": self.step,
+            "total_steps": self.total_steps,
             "result": self.result,
             "error": self.error,
             "asset_id": self.asset_id,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
-            "elapsed_seconds": elapsed,
+            "elapsed_seconds": self._elapsed(),
+            "eta_seconds": self._eta_seconds(),
         }
 
     def short_dict(self) -> Dict[str, Any]:
@@ -149,7 +173,11 @@ class JobRecord:
             "id": self.id,
             "tool": self.tool,
             "status": self.status,
-            "elapsed": round(time.time() - (self.started_at or self.created_at), 1),
+            "progress": round(self.progress, 3),
+            "progress_note": self.progress_note,
+            "elapsed_seconds": round(self._elapsed() or 0.0, 1),
+            "eta_seconds": (round(self._eta_seconds(), 1)
+                            if self._eta_seconds() is not None else None),
             "prompt": self.prompt[:120],
             "asset_id": self.asset_id,
             "error": self.error,
@@ -276,7 +304,13 @@ class EventBus:
 
 # Type aliases for the callbacks the runner invokes back into the server.
 GetConvFn = Callable[[str], Any]           # conv_id -> Conversation-like (must have .events, .jobs)
-ExecuteFn = Callable[[JobRecord], Dict[str, Any]]  # do the actual Lance/text run
+# Progress callback handed to the executor; the executor invokes it from
+# inside the diffusion loop (or wherever progress is observable). Signature:
+#   on_progress(step:int, total_steps:int, note:str="")
+ProgressFn = Callable[[int, int, str], None]
+# The executor is called with (job, on_progress). on_progress is optional —
+# executors that don't have step granularity may simply ignore it.
+ExecuteFn = Callable[[JobRecord, ProgressFn], Dict[str, Any]]
 PostProcessFn = Callable[[JobRecord, Dict[str, Any]], Optional[Asset]]  # build Asset from result
 BackfillFn = Callable[[JobRecord, Dict[str, Any], Optional[Asset]], None]  # update ConvMessage
 
@@ -408,8 +442,47 @@ class JobRunner:
             "tool_call_id": job.tool_call_id,
         })
 
+        # Throttle progress event emission so we don't flood the SSE stream
+        # — 50 denoising steps over a 2-minute generation works out to one
+        # step every ~2.4 s, so we'd never naturally exceed this, but a
+        # faster machine could. Always emit the final step (step == total).
+        last_emit = [0.0]
+        EMIT_MIN_INTERVAL = 0.4
+
+        def on_progress(step: int, total_steps: int, note: str = "") -> None:
+            try:
+                job.step = int(step)
+                job.total_steps = int(total_steps)
+                if total_steps > 0:
+                    job.progress = max(0.0, min(1.0, step / float(total_steps)))
+                if note:
+                    job.progress_note = note
+                else:
+                    job.progress_note = f"step {step}/{total_steps}" if total_steps else ""
+                now = time.time()
+                is_final_step = (total_steps > 0 and step >= total_steps)
+                if is_final_step or (now - last_emit[0]) >= EMIT_MIN_INTERVAL:
+                    last_emit[0] = now
+                    elapsed = job._elapsed()
+                    eta = job._eta_seconds()
+                    conv.events.emit("job_progress", {
+                        "job_id": job.id,
+                        "tool": job.tool,
+                        "lance_task": job.lance_task,
+                        "step": job.step,
+                        "total_steps": job.total_steps,
+                        "progress": job.progress,
+                        "progress_note": job.progress_note,
+                        "elapsed_seconds": elapsed,
+                        "eta_seconds": eta,
+                        "tool_call_id": job.tool_call_id,
+                    })
+            except Exception as e:  # noqa: BLE001
+                # Never let a progress hook break the actual generation.
+                _log(f"progress callback error for job {job.id}: {e}")
+
         try:
-            result = self._execute(job)
+            result = self._execute(job, on_progress)
             job.result = result
             job.status = "done"
             job.finished_at = time.time()

@@ -99,15 +99,15 @@ You have access to ByteDance Lance, a unified multimodal model. You yourself han
 
 # Generation tools (async — they queue a background job)
 
-- `generate_image(prompt, aspect)` — make a brand-new image from a text prompt. Use when the user asks to "draw", "create", "make", "generate", "render", "paint", "show me" an image / picture / photo / illustration. ~2 min.
-- `generate_video(prompt, resolution, num_frames)` — make a short video clip. SLOW: ~3 min at 192p, ~8 min at 360p, ~26 min at 480p. If the user just says "make a video", default to 192p and 49 frames and warn that higher quality takes longer.
-- `edit_image(instruction, asset_id?)` — apply an edit ("make it night-time", "add a hat", "change the hair color"). Targets the most recent image by default; pass `asset_id` to edit a specific older one. Identity is preserved through the edit. ~1 min.
-- `edit_video(instruction, asset_id?)` — same idea for video. Also slow.
+- `generate_image(prompt, aspect)` — make a brand-new image from a text prompt. Use when the user asks to "draw", "create", "make", "generate", "render", "paint", "show me" an image / picture / photo / illustration.
+- `generate_video(prompt, resolution, num_frames)` — make a short video clip. Video generation is much slower than image generation, especially at higher resolutions and longer frame counts. If the user just says "make a video", default to 192p / 49 frames and warn that higher resolution or more frames takes proportionally longer.
+- `edit_image(instruction, asset_id?)` — apply an edit ("make it night-time", "add a hat", "change the hair color"). Targets the most recent image by default; pass `asset_id` to edit a specific older one. Identity is preserved through the edit.
+- `edit_video(instruction, asset_id?)` — same idea for video. Same speed caveats as `generate_video`.
 
 # State-query tools (instant)
 
 - `list_jobs(status?)` — list jobs in this conversation. Status filter: "running", "queued", "done", "failed", "all" (default "all").
-- `get_job(job_id)` — get full status of one job including its result asset.
+- `get_job(job_id)` — get full status of one job including its result asset and live progress (step count, elapsed seconds, estimated remaining seconds).
 - `list_assets(kind?, limit?)` — list images/videos in this conversation, newest first. `kind`: "image", "video", "all" (default "all").
 - `get_asset(asset_id)` — get one asset's details.
 - `cancel_job(job_id)` — request cancellation of a queued or running job. (Running jobs can't actually be preempted; this is mostly useful for queued ones.)
@@ -116,7 +116,7 @@ You have access to ByteDance Lance, a unified multimodal model. You yourself han
 
 When you call a generation tool, you get back `{job_id, status: "queued"}` almost instantly — NOT the finished image. Lance runs the job in the background while the user continues chatting. The image/video appears in the chat UI automatically when ready; you do not have to wait for it.
 
-After issuing the call, respond with a brief friendly acknowledgement ("Sure — kicking that off, it should be ready in about 2 minutes. While we wait, …") and then continue the conversation. Do not pretend the result is already there. Do not keep calling the same tool over and over.
+Generation times depend on the user's hardware and you do NOT know it. Do not state a fixed wall-clock estimate when you issue a tool call. Instead, acknowledge that it's running in the background ("Sure — kicking that off in the background. While we wait, …") and continue the conversation. If the user asks "how long?" or "is it ready?", call `get_job(job_id)` and use the returned `progress` (0..1), `elapsed_seconds`, and `eta_seconds` to give a live, accurate estimate. Never quote a static minutes figure.
 
 On a later turn, if the user asks "is it ready?" or "what did you make?", call `list_jobs(status="done")` or `list_jobs(status="running")` to check. You can also see the result in your conversation history once the job completes — the tool message that originally said `{status: queued}` gets back-filled to the final result automatically.
 
@@ -137,7 +137,8 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
         "generate_image",
         "Generate a new image from a text prompt using the Lance image model. "
         "Use whenever the user asks to draw, create, make, generate, render, paint, "
-        "or show an image / picture / photo / illustration. Takes about 2 minutes.",
+        "or show an image / picture / photo / illustration. Async — returns a "
+        "job_id immediately; check progress with get_job(job_id).",
         {
             "type": "object",
             "properties": {
@@ -158,8 +159,10 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
     _tool(
         "generate_video",
         "Generate a short video clip from a text prompt using the Lance video model. "
-        "SLOW: ~3 min at 192p, ~8 min at 360p, ~26 min at 480p. Confirm before invoking unless the user explicitly asked for a video. "
-        "Default to 192p / 49 frames unless the user requested better quality.",
+        "Significantly slower than image generation, and cost scales with resolution and frame count. "
+        "Confirm before invoking unless the user explicitly asked for a video. "
+        "Default to 192p / 49 frames unless the user requested better quality. "
+        "Async — check progress with get_job(job_id).",
         {
             "type": "object",
             "properties": {
@@ -171,7 +174,7 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
                     "type": "string",
                     "enum": ["192p", "360p", "480p"],
                     "default": "192p",
-                    "description": "192p=320x192 (fastest, ~3 min), 360p=640x384 (~8 min), 480p=832x480 (best, ~26 min).",
+                    "description": "192p=320x192 (cheapest), 360p=640x384, 480p=832x480 (best, slowest).",
                 },
                 "num_frames": {
                     "type": "integer",
@@ -186,7 +189,8 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
         "edit_image",
         "Apply an edit instruction to an image in this conversation. "
         "Lance's image-edit model preserves identity (faces, objects, scene structure) while applying the requested change. "
-        "Use when the user wants to modify, change, alter, or edit a picture. Async — returns a job_id; the result appears in chat in ~1 min.",
+        "Use when the user wants to modify, change, alter, or edit a picture. "
+        "Async — returns a job_id immediately; check progress with get_job(job_id).",
         {
             "type": "object",
             "properties": {
@@ -205,7 +209,8 @@ LANCE_TOOLS: List[Dict[str, Any]] = [
     _tool(
         "edit_video",
         "Apply an edit instruction to a video in this conversation. "
-        "SLOW (~26 min for 480p). Confirm with the user first. Async — returns a job_id immediately.",
+        "Slow — same speed caveats as generate_video. Confirm with the user first. "
+        "Async — returns a job_id immediately; check progress with get_job(job_id).",
         {
             "type": "object",
             "properties": {
