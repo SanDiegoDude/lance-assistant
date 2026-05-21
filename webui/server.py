@@ -1350,6 +1350,103 @@ def _video_edit_num_frames(probe: Dict[str, Any], requested: int = 81) -> int:
     return 4 * k + 1
 
 
+# Lance's MultiClipsFrameSampler is hard-coded to sample at 12 FPS and
+# cap clip duration at 6 s (see validation_dataset.py: sample_fps=12,
+# max_duration=6.0). Feeding it a 24 FPS source means it temporally
+# subsamples, and on some clips that path crashes deep inside the model
+# with opaque tensor-shape errors. We avoid the whole class of problem
+# by re-encoding non-12 FPS / >6 s clips to those exact specs before
+# the edit pipeline ever sees them.
+_LANCE_VIDEO_TARGET_FPS = 12
+_LANCE_VIDEO_MAX_DURATION = 6.0
+
+
+def normalize_video_for_edit(
+    src: Path,
+    dst_dir: Path,
+    probe: Optional[Dict[str, Any]] = None,
+) -> Tuple[Path, Dict[str, Any]]:
+    """Re-encode `src` to Lance-compatible 12 FPS / <=6 s MP4 if needed.
+
+    Returns ``(out_path, info)`` where ``info`` is one of:
+      - ``{"normalized": False, "reason": "already compatible"}``
+      - ``{"normalized": True, "src_fps": ..., "src_duration": ...,
+          "out_fps": 12, "out_duration": ..., "out_frame_count": ...}``
+
+    ``out_path`` equals ``src`` when no normalization was needed. Raises
+    ``RuntimeError`` if ffmpeg is unavailable or the conversion fails.
+    """
+    if probe is None:
+        probe = probe_video(src)
+
+    src_fps = probe.get("fps") or 0.0
+    src_duration = probe.get("duration_seconds") or 0.0
+
+    fps_close = abs(src_fps - _LANCE_VIDEO_TARGET_FPS) < 0.5
+    duration_ok = src_duration > 0 and src_duration <= _LANCE_VIDEO_MAX_DURATION + 0.1
+    container_ok = src.suffix.lower() in {".mp4"}
+
+    if fps_close and duration_ok and container_ok:
+        return src, {"normalized": False, "reason": "already 12fps and <=6s mp4"}
+
+    ffmpeg = _ffmpeg_binary()
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / f"{src.stem}_norm12fps.mp4"
+
+    cmd: List[str] = [
+        ffmpeg, "-y", "-i", str(src),
+        "-r", str(_LANCE_VIDEO_TARGET_FPS),
+        "-t", f"{_LANCE_VIDEO_MAX_DURATION:.2f}",
+        "-vsync", "cfr",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-an",  # drop audio, Lance doesn't read it
+        str(dst),
+    ]
+    import subprocess
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"ffmpeg normalization timed out after 120s: {e}")
+    if res.returncode != 0:
+        tail = (res.stderr or "")[-400:]
+        raise RuntimeError(f"ffmpeg normalization failed (rc={res.returncode}): {tail}")
+
+    out_probe = probe_video(dst)
+    info = {
+        "normalized": True,
+        "src_fps": src_fps,
+        "src_duration_seconds": src_duration,
+        "src_frame_count": probe.get("frame_count"),
+        "out_fps": out_probe.get("fps"),
+        "out_duration_seconds": out_probe.get("duration_seconds"),
+        "out_frame_count": out_probe.get("frame_count"),
+    }
+    return dst, info
+
+
+def _ffmpeg_binary() -> str:
+    """Locate an ffmpeg binary. Prefer the one bundled with the
+    ``imageio-ffmpeg`` pip dependency so users don't need apt-get
+    install ffmpeg as a separate step. Falls back to PATH lookup.
+    """
+    try:
+        import imageio_ffmpeg  # type: ignore
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+        if path:
+            return path
+    except Exception:
+        pass
+    import shutil as _sh
+    path = _sh.which("ffmpeg")
+    if path:
+        return path
+    raise RuntimeError(
+        "ffmpeg not found. Install imageio-ffmpeg (it ships its own "
+        "binary) or system ffmpeg (apt-get install ffmpeg)."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Conversation state + agentic message handling
 # ---------------------------------------------------------------------------
@@ -1476,12 +1573,50 @@ class AppState:
         shape that LancePipeline.run() expects. ``on_progress(step, total,
         note)`` is forwarded to the diffusion-step hook so the agent can
         report live progress.
+
+        For ``video_edit`` we first normalize the source clip to Lance's
+        expected 12 FPS / <=6 s MP4 — Lance's frame sampler crashes deep
+        in the model on some non-12 FPS clips and the conversion is fast
+        compared to the actual edit job.
         """
         if job.lance_task == "text":
             text = self.text.chat(
                 job.prompt, max_new_tokens=int(job.lance_params.get("max_new_tokens", 512))
             )
             return {"kind": "text", "text": text}
+
+        if job.lance_task == "video_edit" and job.attachment_path:
+            try:
+                on_progress(0, 0, "normalizing source video to 12 FPS")
+                src = Path(job.attachment_path)
+                dst, info = normalize_video_for_edit(
+                    src, dst_dir=TMP_DIR / "normalized",
+                )
+                if info.get("normalized"):
+                    log(f"job {job.id} normalized {src.name}: "
+                        f"{info.get('src_fps', 0):.1f}fps "
+                        f"{info.get('src_duration_seconds', 0):.2f}s "
+                        f"({info.get('src_frame_count', 0)} frames) -> "
+                        f"{info.get('out_fps', 0):.1f}fps "
+                        f"{info.get('out_duration_seconds', 0):.2f}s "
+                        f"({info.get('out_frame_count', 0)} frames)")
+                    job.attachment_path = str(dst)
+                    # Recompute num_frames for the normalized clip so the
+                    # inference args reflect what Lance will actually see.
+                    new_probe = {"frame_count": info.get("out_frame_count")}
+                    job.lance_params["num_frames"] = _video_edit_num_frames(
+                        new_probe, requested=81,
+                    )
+                else:
+                    log(f"job {job.id} skipped video normalization: "
+                        f"{info.get('reason', '')}")
+            except Exception as e:  # noqa: BLE001
+                # If ffmpeg blows up we'd rather surface a clean error
+                # now than die deep in Lance's frame sampler.
+                raise RuntimeError(
+                    f"could not normalize source video for editing: {e}"
+                )
+
         legacy = Job(
             id=job.id,
             task=job.lance_task,
