@@ -2581,8 +2581,8 @@ async def run_agentic_turn(conv: Conversation) -> None:
 
                     # Submit (non-blocking)
                     state.runner.submit(job)
-                    debug(f"job submitted id={job.id} kind={job.kind} "
-                          f"conv={conv.id} variant={getattr(job, 'variant', None)}")
+                    debug(f"job submitted id={job.id} tool={job.tool} "
+                          f"lance_task={job.lance_task} conv={conv.id}")
                     queued_payload = {
                         "job_id": job.id,
                         "status": "queued",

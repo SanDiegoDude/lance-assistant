@@ -665,11 +665,23 @@ class OrchestratorClient:
             _dbg(f"_refetch_tool_calls HTTP {r.status_code} body={r.text[:400]!r}")
             return []
         body = r.json()
+        if _debug_enabled():
+            # Dump the whole non-streaming response so we can see exactly
+            # what LM Studio returns when the streaming path eats the
+            # tool_call deltas. Truncate aggressively in case it's huge.
+            _dbg(f"_refetch_tool_calls body={json.dumps(body)[:1500]!r}")
         choices = body.get("choices") or []
         if not choices:
             return []
         msg = (choices[0] or {}).get("message") or {}
         tcs = msg.get("tool_calls") or []
+        if _debug_enabled():
+            finish = (choices[0] or {}).get("finish_reason")
+            content = msg.get("content")
+            _dbg(f"_refetch_tool_calls choice finish={finish!r} "
+                 f"msg_keys={list(msg.keys())} "
+                 f"content_len={len(content) if isinstance(content, str) else 0} "
+                 f"tool_calls={len(tcs)}")
         out: List[Dict[str, Any]] = []
         for idx, tc in enumerate(tcs):
             func = tc.get("function") or {}
