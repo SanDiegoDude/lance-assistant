@@ -1182,18 +1182,68 @@
 
     function App() {
       const chat = useChat();
-      const scrollRef = useRef(null);
+      const scrollRef = useRef(null);    // the overflow-y-auto viewport
+      const contentRef = useRef(null);   // the inner growing content
+      // Stick to the bottom by default. Flipped off when the user scrolls
+      // up themselves, flipped back on when they scroll back near bottom.
+      // We keep this in a ref (not state) so the ResizeObserver callback
+      // can read the latest value without re-creating itself.
+      const pinnedRef = useRef(true);
+      const [showJumpToLatest, setShowJumpToLatest] = useState(false);
 
+      // Detect user-driven scroll changes so streaming/reflection updates
+      // don't yank them out of mid-history review.
       useEffect(() => {
-        if (!scrollRef.current) return;
         const el = scrollRef.current;
-        // Only auto-scroll if user is near the bottom; respect their scroll
-        // position so they can review while a job runs in the background.
-        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
-        if (nearBottom) {
-          el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-        }
-      }, [chat.messages.length, chat.messages.map(m => m.blocks?.length || 0).join(",")]);
+        if (!el) return;
+        const onScroll = () => {
+          const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+          pinnedRef.current = nearBottom;
+          setShowJumpToLatest(!nearBottom);
+        };
+        el.addEventListener("scroll", onScroll, { passive: true });
+        return () => el.removeEventListener("scroll", onScroll);
+      }, []);
+
+      // React to ANY size change of the message content — committed
+      // messages, streaming "thinking" text, expanded thought panels,
+      // images finishing their layout pass, post-job reflection bubbles —
+      // and keep the viewport pinned to the bottom unless the user
+      // intentionally scrolled up.
+      useEffect(() => {
+        const el = scrollRef.current;
+        const content = contentRef.current;
+        if (!el || !content) return;
+        const scrollToBottom = () => {
+          el.scrollTop = el.scrollHeight;
+        };
+        const ro = new ResizeObserver(() => {
+          if (pinnedRef.current) scrollToBottom();
+        });
+        ro.observe(content);
+        // Late-loading <img> elements (the chat is image-heavy) finish
+        // their first layout pass after the ResizeObserver has already
+        // fired for the surrounding container — listen for image loads
+        // and re-pin if needed.
+        const onLoad = (e) => {
+          if (e.target && (e.target.tagName === "IMG" || e.target.tagName === "VIDEO")) {
+            if (pinnedRef.current) scrollToBottom();
+          }
+        };
+        content.addEventListener("load", onLoad, true);
+        return () => {
+          ro.disconnect();
+          content.removeEventListener("load", onLoad, true);
+        };
+      }, []);
+
+      const jumpToLatest = useCallback(() => {
+        const el = scrollRef.current;
+        if (!el) return;
+        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+        pinnedRef.current = true;
+        setShowJumpToLatest(false);
+      }, []);
 
       const onUseAsInput = useCallback((toolBlock) => {
         if (!toolBlock.media_url) return;
@@ -1271,8 +1321,8 @@
           <${ActiveJobsBanner} activeJobs=${chat.activeJobs} onCancel=${onCancelJob} />
 
           <!-- Messages -->
-          <div ref=${scrollRef} class="flex-1 overflow-y-auto">
-            <div class="max-w-3xl mx-auto px-4 py-6 space-y-4 min-h-full">
+          <div ref=${scrollRef} class="flex-1 overflow-y-auto relative">
+            <div ref=${contentRef} class="max-w-3xl mx-auto px-4 py-6 space-y-4 min-h-full">
               ${groups.length === 0
                 ? html`<${EmptyState} orchOk=${orchOk} onPick=${(idea) => {
                     chat.submit({ prompt: idea.label, mode: idea.mode, useOrchestrator: orchOk });
@@ -1293,6 +1343,14 @@
                     return null;
                   })}
             </div>
+            ${showJumpToLatest ? html`
+              <button onClick=${jumpToLatest}
+                class="sticky bottom-3 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full
+                       bg-bg-2/95 border border-line text-[11px] text-txt-1 hover:text-txt-0
+                       hover:bg-bg-3 backdrop-blur shadow-lg flex items-center gap-1.5 z-10"
+                style="display: inline-flex;">
+                <span>↓</span> jump to latest
+              </button>` : null}
           </div>
 
           <${Composer} chat=${chat} />
