@@ -446,31 +446,55 @@ the card), set the standard fragmentation hint:
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
 
-### Picking the right model variant
+### Picking the right model variant (and hot-swapping)
 
 ByteDance ships **two** fine-tunes of Lance:
 
 | Variant | Checkpoint dir | Strengths | Weaknesses |
 |---|---|---|---|
-| `image` (default) | `Lance_3B/` | Crisp in-image text, sharper detail; used for every image benchmark on the project page (GenEVAL, DPG, GEdit) | No video generation/editing |
+| `image` | `Lance_3B/` | Crisp in-image text, sharper detail; used for every image benchmark on the project page (GenEVAL, DPG, GEdit) | No video generation/editing |
 | `video` | `Lance_3B_Video/` | Supports `generate_video` / `edit_video` / `x2t_video` | Image text rendering is noticeably worse — words come out garbled/incoherent |
 
-Pick one with `LANCE_MODEL_VARIANT={image,video,auto}` in your `.env`. The
-default is `auto`, which prefers whichever is already on disk and falls
-back to `image` for fresh installs (the saner default since 90 % of users
-want images first).
+Pick the mode with `LANCE_MODEL_VARIANT={image,video,auto}` in your `.env`:
 
-If you change the variant after the first run, the server downloads the
-other checkpoint (~30 GB) on next start. You can also pre-fetch both:
+- `image` — server locks to image-only (`generate_image`, `edit_image`,
+  `x2t_image`). Video tool calls are rejected.
+- `video` — server locks to video-only (the video checkpoint also covers
+  image gen, with worse text fidelity).
+- `auto` (default) — **both** variants available. The server starts on
+  whichever is already on disk (prefers image for fresh installs) and
+  loads the other one lazily the first time you ask for a task that
+  needs it. Inside a chat, image tasks use the image variant and video
+  tasks use the video variant — best of both worlds.
+
+### Hot-swapping for 24 GB cards (`--lowvram`)
+
+In `auto` mode the server keeps both variants in VRAM by default — fine
+on big-VRAM hardware (40 GB+) but it won't fit on a 4090. Pass
+`--lowvram` (or set `LANCE_LOWVRAM=1`) and the server will keep just one
+variant on the GPU at a time, parking the inactive one in system RAM and
+hot-swapping when the task changes:
+
 ```bash
-python -m lance download --group image  # ~30 GB
-python -m lance download --group video  # ~30 GB
+./scripts/run_webui.sh --lowvram
+# or
+LANCE_LOWVRAM=1 ./scripts/run_webui.sh
 ```
 
-Each checkpoint produces a different network — we don't (yet) support
-keeping both in VRAM simultaneously. If you need both image and video on
-the same install, set `LANCE_MODEL_VARIANT=video` and accept the image
-quality trade-off until we add a model-swap path.
+A swap moves ~6-8 GB between system RAM and VRAM, so on a 4090 with
+DDR5 system RAM it adds ~2-3 s the first time you flip from images to
+video (and back). After that the bundle stays cached in CPU RAM, so the
+swap-back is the same ~2-3 s and there's no re-download or re-init from
+disk. If you've got a slower machine — or you genuinely only need one
+variant — set `LANCE_MODEL_VARIANT=image` or `=video` and skip the swap
+machinery entirely.
+
+You can also pre-fetch both checkpoints up front (otherwise the second
+one downloads lazily the first time it's needed):
+```bash
+python -m lance download --group image  # ~30 GB → weights/Lance_hf/Lance_3B/
+python -m lance download --group video  # ~30 GB → weights/Lance_hf/Lance_3B_Video/
+```
 
 ## Fetching weights
 

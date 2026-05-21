@@ -10,14 +10,36 @@
 # Usage:
 #   ./scripts/run_webui.sh                  # binds 0.0.0.0:7861
 #   ./scripts/run_webui.sh 8080             # custom port
+#   ./scripts/run_webui.sh --lowvram        # one variant on GPU at a time
+#   ./scripts/run_webui.sh --lowvram 8080
 #   PORT=8080 HOST=127.0.0.1 ./scripts/run_webui.sh
 #
+# Flags:
+#   --lowvram    enable hot-swapping between image / video Lance variants
+#                (only one resides on the GPU at a time; the other is
+#                parked in system RAM). Sets LANCE_LOWVRAM=1. Recommended
+#                for 24 GB cards (4090); leave off on big-VRAM hardware
+#                so both variants stay GPU-resident and swap is free.
+#
 # Environment overrides:
-#   PYTHON   path to python (defaults to .venv/bin/python, then `python3`)
-#   HOST     bind address (default 0.0.0.0)
-#   PORT     bind port    (default 7861)
+#   PYTHON          path to python (defaults to .venv/bin/python, then `python3`)
+#   HOST            bind address (default 0.0.0.0)
+#   PORT            bind port    (default 7861)
+#   LANCE_LOWVRAM   same as --lowvram (1 / true / yes / on enables)
+#   LANCE_MODEL_VARIANT  image | video | auto (default auto — both available)
+#   LANCE_DTYPE     bfloat16 (default) | float16 | float32
 
 set -euo pipefail
+
+# Parse our own flags before falling through to positional args.
+for arg in "$@"; do
+    case "$arg" in
+        --lowvram)
+            export LANCE_LOWVRAM=1
+            shift
+            ;;
+    esac
+done
 
 PORT="${1:-${PORT:-7861}}"
 HOST="${HOST:-0.0.0.0}"
@@ -55,8 +77,13 @@ echo "================================================================"
 echo "  Lance Assistant"
 echo "  Open  http://${HOST}:${PORT}  (or http://localhost:${PORT})"
 echo ""
+if [ "${LANCE_LOWVRAM:-0}" = "1" ] || [ "${LANCE_LOWVRAM:-0}" = "true" ]; then
+    echo "  Mode: --lowvram (one variant on GPU at a time, hot-swap on demand)"
+fi
 echo "  Note: first launch will download ~32 GB of Lance weights from"
 echo "  Hugging Face into weights/Lance_hf/ (resumable, only once)."
+echo "  Under LANCE_MODEL_VARIANT=auto (default), the second variant is"
+echo "  downloaded lazily on the first task that needs it (~16 GB more)."
 echo "================================================================"
 echo ""
 

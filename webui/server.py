@@ -124,6 +124,14 @@ def log(msg: str) -> None:
     print(f"[lance-webui {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _env_truthy(name: str, default: bool = False) -> bool:
+    """Read a boolean env var. Accepts 1/0, true/false, yes/no, on/off."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 # ---------------------------------------------------------------------------
 # Job model
 # ---------------------------------------------------------------------------
@@ -169,23 +177,66 @@ class Job:
 # Lance pipeline (multimodal: t2i/t2v/edit/understand)
 # ---------------------------------------------------------------------------
 
+@dataclass
+class _ModelBundle:
+    """All Lance state tied to a single variant (image or video).
+
+    Each variant ships its own checkpoint with auxiliary modules
+    (``time_embedder``, ``vae2llm``, ``llm2vae``, ``latent_pos_embed``, …)
+    fine-tuned alongside the LLM, so we keep two complete Lance containers
+    around and swap them between GPU and CPU on demand. The ViT and the
+    Wan-VAE are technically identical across variants, but they're embedded
+    in the checkpoint state-dict, so it's simpler to just load two complete
+    bundles than to share the sub-modules.
+    """
+    variant: str           # "image" or "video"
+    model: Any             # Lance container (LLM + ViT + VAE + aux modules)
+    vae_model: Any
+    vae_config: Any
+    tokenizer: Any
+    new_token_ids: Dict[str, int]
+    image_token_id: int
+    base_model_args: Any
+    base_data_args: Any
+    base_inference_args: Any
+    on_device: bool        # True if model.parameters() are currently on GPU
+
+
+# Which Lance variant a given task requires. None = either works (the
+# active variant gets used, no swap needed).
+_TASK_VARIANT: Dict[str, Optional[str]] = {
+    "t2i":        "image",   # image variant produces crisp text in image-gen
+    "image_edit": "image",
+    "t2v":        "video",
+    "video_edit": "video",
+    "x2t_image":  None,      # understanding works on either ViT
+    "x2t_video":  "video",   # only video variant has temporal layers
+}
+
+
 class LancePipeline:
     """Wraps the official Lance model and dispatches across the 6 multimodal
-    tasks. Loads weights once, then `run(...)` is reusable for any task.
+    tasks. Loads weights once, then ``run(...)`` is reusable for any task.
+
+    Supports two checkpoint variants (``lance_3b`` image-focused and
+    ``lance_3b_video`` video-focused). The active variant is chosen
+    automatically based on the task being run; behavior is controlled by
+    two env knobs:
+
+      * ``LANCE_MODEL_VARIANT={image,video,auto}`` (default ``auto``) —
+        ``image`` and ``video`` lock the pipeline to a single checkpoint
+        (other variant's tasks raise an error). ``auto`` loads whichever
+        checkpoint(s) are needed.
+      * ``LANCE_LOWVRAM={0,1}`` (default ``0``) — when set, only one
+        variant ever lives on the GPU at a time; the inactive one is
+        parked in system RAM and we hot-swap on task changes. Costs ~2-3 s
+        per swap on fast PCIe / RAM. When unset (the default for big-VRAM
+        cards like the DGX), both variants stay GPU-resident and there's
+        no swap cost.
 
     Heavily adapted from refs/lance_official/lance_gradio_t2v_v2t.py.
     """
 
-    # --- model variant selection -------------------------------------------
-    # ByteDance ships two fine-tunes of the same base architecture:
-    #   * lance_3b        — image-focused; produces the crisp-text demos on
-    #                       the project page; default for the inference_lance.sh
-    #                       script and every image-gen benchmark
-    #   * lance_3b_video  — video-focused; supports every task but with
-    #                       degraded image fidelity (worse text rendering)
-    # Pick which one to load via LANCE_MODEL_VARIANT. The "auto" option uses
-    # the image variant when it's on disk and falls back to video, which is
-    # the cheapest correct default given that 90% of users want images.
     @staticmethod
     def _resolve_variant() -> str:
         v = (os.environ.get("LANCE_MODEL_VARIANT") or "auto").strip().lower()
@@ -197,10 +248,28 @@ class LancePipeline:
     def _variant_dir(variant: str) -> str:
         return "lance_3b" if variant == "image" else "lance_3b_video"
 
+    @staticmethod
+    def _variant_for_task(task: str) -> Optional[str]:
+        return _TASK_VARIANT.get(task)
+
     def __init__(self, device: int = 0):
         self.device = device
         self.lock = threading.RLock()
         self.initialized = False
+        # Cache of loaded bundles, keyed by variant ("image" / "video").
+        # Bundles are created lazily on first need (load_variant) and then
+        # either stay GPU-resident (normal mode) or shuttled between GPU
+        # and CPU (low-vram mode).
+        self.bundles: Dict[str, _ModelBundle] = {}
+        self.active_variant: Optional[str] = None
+        self.requested_variant: str = "auto"       # what the user asked for
+        self.lowvram: bool = False                 # set in initialize()
+        self.load_dtype: torch.dtype = torch.bfloat16  # set in initialize()
+        # Backward-compat mirror fields, updated by _activate_variant() so
+        # the rest of the pipeline (and external callers like make_job,
+        # _situation_header, …) can keep reading pipeline.model /
+        # pipeline.tokenizer / pipeline.variant without knowing about
+        # bundles.
         self.model = None
         self.vae_model = None
         self.vae_config = None
@@ -210,42 +279,78 @@ class LancePipeline:
         self.base_model_args = None
         self.base_data_args = None
         self.base_inference_args = None
-        self.variant: str = "image"   # resolved in _ensure_weights_and_symlinks
+        self.variant: str = "image"   # mirrors active_variant for legacy callers
+
+    # ---- public init flow -----------------------------------------------
 
     def initialize(self) -> None:
+        """One-shot init that resolves the requested variant, picks the
+        first variant to load, and brings it onto the GPU. Secondary
+        variants (under ``LANCE_MODEL_VARIANT=auto``) are loaded lazily on
+        first use — see :meth:`_activate_variant`.
+        """
         with self.lock:
             if self.initialized:
                 return
             t0 = time.perf_counter()
+
+            self.requested_variant = self._resolve_variant()
+            self.lowvram = _env_truthy("LANCE_LOWVRAM")
+
+            dtype_str = os.environ.get("LANCE_DTYPE", "bfloat16").lower()
+            self.load_dtype = {
+                "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+                "float16":  torch.float16,  "fp16": torch.float16,  "half": torch.float16,
+                "float32":  torch.float32,  "fp32": torch.float32,
+            }.get(dtype_str, torch.bfloat16)
+
+            startup_variant = self._pick_startup_variant()
             log(f"loading Lance model onto GPU {self.device}...")
-            self._ensure_weights_and_symlinks()
-            self._initialize_inner()
+            log(f"  requested={self.requested_variant!r} startup={startup_variant!r} "
+                f"lowvram={self.lowvram} dtype={dtype_str}")
+
+            self._ensure_weights_for_variant(startup_variant, prompt_download=True)
+            # _activate_variant does the load if the bundle isn't cached.
+            # Since this is startup, the bundles dict is empty so it will.
+            self._activate_variant(startup_variant)
+
             log(f"Lance model ready in {time.perf_counter() - t0:.1f}s")
             self.initialized = True
 
-    def _ensure_weights_and_symlinks(self) -> None:
-        """Make sure Lance weights are present and the official code's
-        downloads/ symlinks are set up. Downloads from HF on first run.
+    def _allowed_variants(self) -> set:
+        """Which variants this server is allowed to run.
 
-        Honors LANCE_MODEL_VARIANT={image,video,auto} — for `auto` we prefer
-        the image checkpoint (better text rendering / image fidelity) and
-        fall back to whatever is already on disk.
+        ``LANCE_MODEL_VARIANT=image`` locks to image-only (video tasks
+        rejected); ``video`` locks to video-only; ``auto`` enables both.
+        """
+        if self.requested_variant == "image":
+            return {"image"}
+        if self.requested_variant == "video":
+            return {"video"}
+        return {"image", "video"}
+
+    def _pick_startup_variant(self) -> str:
+        """Pick which variant to load at server startup.
+
+        Locked modes use that variant directly. ``auto`` prefers whichever
+        checkpoint is already on disk (no redundant download), defaulting
+        to image for fresh installs since most workflows are image-first.
+        """
+        if self.requested_variant in ("image", "video"):
+            return self.requested_variant
+        weights_root = ROOT / "weights" / "Lance_hf"
+        if (weights_root / "Lance_3B" / "model.safetensors").exists():
+            return "image"
+        if (weights_root / "Lance_3B_Video" / "model.safetensors").exists():
+            return "video"
+        return "image"
+
+    def _ensure_weights_for_variant(self, variant: str, prompt_download: bool) -> None:
+        """Make sure the on-disk checkpoint + ViT + VAE for ``variant``
+        are present (download from HF if not) and wire up the symlinks
+        that the official code expects under ``refs/lance_official/downloads/``.
         """
         weights_root = ROOT / "weights" / "Lance_hf"
-        requested = self._resolve_variant()
-        image_present = (weights_root / "Lance_3B" / "model.safetensors").exists()
-        video_present = (weights_root / "Lance_3B_Video" / "model.safetensors").exists()
-
-        if requested == "auto":
-            if image_present:
-                variant = "image"
-            elif video_present:
-                variant = "video"
-            else:
-                variant = "image"  # prefer image for fresh installs
-        else:
-            variant = requested
-
         hf_dir   = "Lance_3B" if variant == "image" else "Lance_3B_Video"
         dl_group = "image"    if variant == "image" else "video"
 
@@ -256,23 +361,26 @@ class LancePipeline:
         ]
         need_download = not all(p.exists() for p in required_files)
         if need_download:
-            log(f"Lance weights missing — auto-downloading variant={variant!r}")
-            log(f"  target: {weights_root}")
-            log(f"  size:   ~32 GB ({variant} model + ViT + VAE), resumable")
+            if prompt_download:
+                log(f"Lance weights missing — auto-downloading variant={variant!r}")
+                log(f"  target: {weights_root}")
+                log(f"  size:   ~32 GB ({variant} model + ViT + VAE), resumable")
+            else:
+                log(f"  hot-swap: variant={variant!r} not on disk yet — downloading")
             from lance.download import GROUPS, download_files
             try:
                 download_files(weights_root, GROUPS[dl_group], dry_run=False)
             except Exception as e:  # noqa: BLE001
                 raise RuntimeError(
-                    f"Auto-download failed: {e}\n"
+                    f"Auto-download failed for variant={variant!r}: {e}\n"
                     f"You can run it manually with:\n"
                     f"  python -m lance download --group {dl_group} --target {weights_root}"
                 )
-            log("auto-download complete")
-        # Wire up the symlinks the official code expects under
-        # refs/lance_official/downloads/ — only required for the variant we
-        # will actually load; we still link the other one if present so
-        # users can switch variants without re-symlinking.
+            log(f"  download complete for variant={variant!r}")
+
+        # Wire up the symlinks the official code expects. We link both
+        # variant directories if present so the inference path can resolve
+        # whichever is active without re-symlinking on swap.
         official_downloads = LANCE_OFFICIAL / "downloads"
         official_downloads.mkdir(parents=True, exist_ok=True)
         for src_rel, dst_name, required in [
@@ -297,10 +405,13 @@ class LancePipeline:
             except FileExistsError:
                 pass
 
-        self.variant = variant
-        log(f"  using Lance variant: {variant}  (checkpoint: downloads/{self._variant_dir(variant)})")
+    def _apply_one_time_patches(self) -> None:
+        """One-time monkey-patches for the upstream Lance code that have to
+        land before any Lance import / module construction. Idempotent —
+        safe to call repeatedly. Called on first variant load."""
+        if getattr(self, "_patched", False):
+            return
 
-    def _initialize_inner(self) -> None:
         # Undo the torch.compile wrap of flex_attention from
         # modeling/lance/qwen2_navit.py:47. Without this, the x2t text-gen
         # path triggers Inductor → Triton → ptxas (sm_121a fails). The eager
@@ -341,6 +452,22 @@ class LancePipeline:
         except Exception as e:  # noqa: BLE001
             log(f"  warning: could not patch ROPE_INIT_FUNCTIONS: {e}")
 
+        self._patched = True
+
+    def _load_variant_bundle(self, variant: str) -> _ModelBundle:
+        """Load the checkpoint + tokenizer + auxiliary modules for
+        ``variant`` (``"image"`` or ``"video"``) and put the whole Lance
+        container on the GPU. Returns a fresh :class:`_ModelBundle` and
+        registers it in ``self.bundles``.
+
+        Idempotent on the GPU side: if you call this for a variant whose
+        bundle is already cached, it just returns the cached one.
+        """
+        if variant in self.bundles:
+            return self.bundles[variant]
+
+        self._apply_one_time_patches()
+
         from safetensors.torch import load_file
         from transformers import set_seed
         from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
@@ -373,12 +500,10 @@ class LancePipeline:
             )
         torch.cuda.set_device(self.device)
 
-        # Use whichever variant was resolved in _ensure_weights_and_symlinks.
-        # `lance_3b` (image variant) is the one used for the project-page
-        # demos and image-gen benchmarks (GenEVAL, DPG, etc.) and produces
-        # noticeably crisper in-image text. `lance_3b_video` is the video
-        # fine-tune.
-        model_path = str(LANCE_OFFICIAL / "downloads" / self._variant_dir(self.variant))
+        log(f"  loading variant={variant!r} ({self._variant_dir(variant)}) ...")
+        t0 = time.perf_counter()
+
+        model_path = str(LANCE_OFFICIAL / "downloads" / self._variant_dir(variant))
         vit_path = str(LANCE_OFFICIAL / "downloads" / "Qwen2.5-VL-ViT")
 
         model_args = ModelArguments(
@@ -419,7 +544,7 @@ class LancePipeline:
 
         set_seed(inference_args.global_seed)
 
-        log(f"  loading LLM config: {model_path}/llm_config.json")
+        log(f"    llm_config: {model_path}/llm_config.json")
         llm_config = Qwen2Config.from_json_file(str(Path(model_path) / "llm_config.json"))
         llm_config.layer_module = model_args.layer_module
         llm_config.qk_norm = model_args.llm_qk_norm
@@ -436,7 +561,7 @@ class LancePipeline:
         if getattr(llm_config, "pad_token_id", None) is None:
             llm_config.pad_token_id = getattr(llm_config, "bos_token_id", 151643)
 
-        log("  init LLM (Qwen2ForCausalLM)")
+        log("    init LLM (Qwen2ForCausalLM)")
         language_model = Qwen2ForCausalLM(llm_config)
 
         vit_config = Qwen2_5_VLVisionConfig.from_pretrained(vit_path)
@@ -445,13 +570,13 @@ class LancePipeline:
         # kernel; on Blackwell (sm_121a) ptxas refuses that arch. SDPA uses
         # cuDNN / native CUDA, no Triton, works fine.
         vit_config._attn_implementation = "sdpa"
-        log("  init ViT (Qwen2.5-VL, sdpa attention)")
+        log("    init ViT (Qwen2.5-VL, sdpa attention)")
         vit_model = Qwen2_5_VisionTransformerPretrainedModel(vit_config)
         vit_weights = load_file(str(Path(vit_path) / "vit.safetensors"))
         vit_model.load_state_dict(vit_weights, strict=True)
         clean_memory(vit_weights)
 
-        log("  init VAE (Wan 2.2)")
+        log("    init VAE (Wan 2.2)")
         vae_model = WanVideoVAE()
         vae_config = _deepcopy(vae_model.vae_config)
 
@@ -486,27 +611,21 @@ class LancePipeline:
         # llm_config.json), so we lose no precision; load_state_dict casts
         # cross-dtype anyway. Override with LANCE_DTYPE=float16|float32 if
         # you're on big-VRAM hardware and want different precision.
-        dtype_str = os.environ.get("LANCE_DTYPE", "bfloat16").lower()
-        load_dtype = {
-            "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
-            "float16":  torch.float16,  "fp16": torch.float16,  "half": torch.float16,
-            "float32":  torch.float32,  "fp32": torch.float32,
-        }.get(dtype_str, torch.bfloat16)
-        log(f"  move to GPU {self.device} (dtype={dtype_str})")
+        log(f"    move to GPU {self.device} (dtype={self.load_dtype})")
         try:
             torch.cuda.empty_cache()
         except Exception:  # noqa: BLE001
             pass
-        model = model.to(device=self.device, dtype=load_dtype)
+        model = model.to(device=self.device, dtype=self.load_dtype)
 
-        log("  load tokenizer + special tokens")
+        log("    load tokenizer + special tokens")
         tokenizer = Qwen2Tokenizer.from_pretrained(model_path)
         tokenizer, new_token_ids, num_new_tokens = add_special_tokens(tokenizer)
 
         if inference_args.copy_init_moe:
             language_model.init_moe()
 
-        log(f"  load fine-tuned ckpt: {model_path}")
+        log(f"    load fine-tuned ckpt: {model_path}")
         init_from_model_path_if_needed(model, model_args)
 
         if num_new_tokens > 0:
@@ -522,35 +641,157 @@ class LancePipeline:
             model.language_model.untie_lm_head()
             model.language_model.copy_new_token_rows_to_lm_head(num_new_tokens)
 
-        model = model.to(device=self.device, dtype=torch.bfloat16)
+        model = model.to(device=self.device, dtype=self.load_dtype)
         model.eval()
         if hasattr(vae_model, "eval"):
             vae_model.eval()
 
-        self.model = model
-        self.vae_model = vae_model
-        self.vae_config = vae_config
-        self.tokenizer = tokenizer
-        self.new_token_ids = new_token_ids
-        self.image_token_id = image_token_id
-        self.base_model_args = model_args
-        self.base_data_args = data_args
-        self.base_inference_args = inference_args
+        bundle = _ModelBundle(
+            variant=variant,
+            model=model,
+            vae_model=vae_model,
+            vae_config=vae_config,
+            tokenizer=tokenizer,
+            new_token_ids=new_token_ids,
+            image_token_id=image_token_id,
+            base_model_args=model_args,
+            base_data_args=data_args,
+            base_inference_args=inference_args,
+            on_device=True,
+        )
+        self.bundles[variant] = bundle
+        log(f"  variant={variant!r} ready in {time.perf_counter() - t0:.1f}s")
+        return bundle
+
+    # ---- variant lifecycle (hot-swap) -----------------------------------
+
+    def _activate_variant(self, variant: str) -> None:
+        """Make ``variant`` the GPU-resident active model.
+
+        - If the bundle isn't cached yet → loads it from disk (downloads
+          weights if needed).
+        - If we're in low-vram mode and a different variant is currently
+          GPU-resident → parks the current one in system RAM first to
+          free space, then moves the requested one onto the GPU.
+        - In normal mode, both variants stay GPU-resident, so this just
+          swaps the ``self.model`` etc. mirror fields without touching
+          GPU memory.
+        """
+        with self.lock:
+            allowed = self._allowed_variants()
+            if variant not in allowed:
+                raise RuntimeError(
+                    f"variant={variant!r} not allowed by "
+                    f"LANCE_MODEL_VARIANT={self.requested_variant!r} "
+                    f"(allowed: {sorted(allowed)})"
+                )
+
+            # Already active and on-device? Nothing to do.
+            if (self.active_variant == variant
+                    and variant in self.bundles
+                    and self.bundles[variant].on_device):
+                return
+
+            if variant not in self.bundles:
+                if self.lowvram and self.active_variant:
+                    self._park_variant(self.active_variant)
+                try:
+                    self._ensure_weights_for_variant(variant, prompt_download=False)
+                    self._load_variant_bundle(variant)
+                except Exception:
+                    # If we parked the previous variant but failed to load
+                    # the new one, restore the previous variant so the
+                    # pipeline stays in a usable state.
+                    if self.lowvram and self.active_variant and self.active_variant != variant:
+                        prev = self.bundles.get(self.active_variant)
+                        if prev is not None and not prev.on_device:
+                            log(f"  hot-swap → load of {variant!r} failed; "
+                                f"restoring previous variant={self.active_variant!r}")
+                            prev.model.to(device=self.device, dtype=self.load_dtype)
+                            prev.on_device = True
+                    raise
+            else:
+                bundle = self.bundles[variant]
+                if not bundle.on_device:
+                    if self.lowvram and self.active_variant and self.active_variant != variant:
+                        self._park_variant(self.active_variant)
+                    log(f"  hot-swap → moving variant={variant!r} onto GPU "
+                        f"(dtype={self.load_dtype})")
+                    t0 = time.perf_counter()
+                    bundle.model.to(device=self.device, dtype=self.load_dtype)
+                    bundle.on_device = True
+                    log(f"  hot-swap → variant={variant!r} on GPU in "
+                        f"{time.perf_counter() - t0:.1f}s")
+
+            self._point_mirror_at(variant)
+
+    def _park_variant(self, variant: str) -> None:
+        """Move ``variant``'s Lance container off the GPU into CPU RAM and
+        free the cached VRAM allocations. Used in low-vram mode before
+        activating another variant.
+        """
+        bundle = self.bundles.get(variant)
+        if bundle is None or not bundle.on_device:
+            return
+        log(f"  hot-swap → parking variant={variant!r} to CPU")
+        t0 = time.perf_counter()
+        bundle.model.to(device="cpu")
+        bundle.on_device = False
+        try:
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        log(f"  hot-swap → variant={variant!r} on CPU in "
+            f"{time.perf_counter() - t0:.1f}s")
+
+    def _point_mirror_at(self, variant: str) -> None:
+        """Update the legacy ``self.model`` / ``self.tokenizer`` / …
+        mirror fields to point at ``variant``'s bundle. Called whenever
+        we activate a different variant so the rest of the pipeline
+        (and external callers reading ``pipeline.variant``) sees the
+        currently-active model.
+        """
+        bundle = self.bundles[variant]
+        self.active_variant = variant
+        self.variant = variant
+        self.model = bundle.model
+        self.vae_model = bundle.vae_model
+        self.vae_config = bundle.vae_config
+        self.tokenizer = bundle.tokenizer
+        self.new_token_ids = bundle.new_token_ids
+        self.image_token_id = bundle.image_token_id
+        self.base_model_args = bundle.base_model_args
+        self.base_data_args = bundle.base_data_args
+        self.base_inference_args = bundle.base_inference_args
 
     # ---------------------------------------------------------------- run --
 
     def run(self, job: Job) -> Dict[str, Any]:
         """Dispatch a job to the right task. Blocks until done (or raises).
 
-        Returns the public result dict that we store on `job.result`.
+        Hot-swaps the model variant if the task requires one that isn't
+        currently active (see :meth:`_activate_variant`). Returns the
+        public result dict that we store on `job.result`.
         """
         self.initialize()
-        if self.variant == "image" and job.task in ("t2v", "video_edit", "x2t_video"):
-            raise RuntimeError(
-                f"task {job.task!r} requires the lance_3b_video checkpoint, "
-                f"but the server is configured with LANCE_MODEL_VARIANT=image. "
-                f"Set LANCE_MODEL_VARIANT=video in your .env and restart."
-            )
+
+        needed = self._variant_for_task(job.task)
+        if needed is not None:
+            allowed = self._allowed_variants()
+            if needed not in allowed:
+                # The server is locked to the opposite variant (e.g.
+                # LANCE_MODEL_VARIANT=image but a video task slipped
+                # through). This is normally caught earlier in make_job
+                # but we double-check here as a defense in depth.
+                raise RuntimeError(
+                    f"task {job.task!r} requires the {needed!r} Lance "
+                    f"variant, but this server is configured for "
+                    f"LANCE_MODEL_VARIANT={self.requested_variant!r}. "
+                    f"Restart with LANCE_MODEL_VARIANT=auto (or "
+                    f"={needed}) to enable {job.task!r}."
+                )
+            self._activate_variant(needed)
+
         with self.lock:
             torch.cuda.set_device(self.device)
             if job.task in ("t2i", "t2v"):
@@ -1217,16 +1458,18 @@ class AppState:
         """Translate an orchestrator tool call into a JobRecord ready for
         the JobRunner. Validates references like asset_id for edit_*.
         """
-        # Refuse video tasks if we're loaded with the image-only checkpoint
-        # (the image fine-tune has no video temporal layers — it would
-        # produce noise). Same for the inverse, but in practice the video
-        # variant *can* do images, just with degraded fidelity.
-        if tool in ("generate_video", "edit_video") and self.pipeline.variant == "image":
+        # Refuse video tasks if the server is locked to the image-only
+        # variant. In auto mode (the default) both variants are available
+        # and the pipeline will hot-swap as needed, so the only path that
+        # rejects here is when the user explicitly set
+        # LANCE_MODEL_VARIANT=image.
+        if (tool in ("generate_video", "edit_video")
+                and "video" not in self.pipeline._allowed_variants()):
             raise ValueError(
-                f"this server is running the image-only Lance variant "
-                f"(lance_3b); {tool} requires the video checkpoint. "
-                f"Set LANCE_MODEL_VARIANT=video in your .env, re-run "
-                f"setup, and restart the server."
+                f"this server is locked to the image-only Lance variant "
+                f"(LANCE_MODEL_VARIANT=image); {tool} requires the video "
+                f"checkpoint. Restart with LANCE_MODEL_VARIANT=auto (or "
+                f"=video) to enable {tool}."
             )
         if tool == "generate_image":
             aspect = args.get("aspect", "square")
@@ -1735,18 +1978,31 @@ def _situation_header(conv: Conversation) -> str:
     orchestrator is aware of pending jobs and prior assets without having
     to call list_jobs() every turn."""
     lines: List[str] = []
-    variant = getattr(state.pipeline, "variant", "image")
-    if variant == "image":
+    pipeline = state.pipeline
+    requested = getattr(pipeline, "requested_variant", "auto")
+    active = getattr(pipeline, "active_variant", None) or getattr(pipeline, "variant", "image")
+    lowvram = getattr(pipeline, "lowvram", False)
+
+    if requested == "image":
         lines.append(
-            "- Lance model variant: IMAGE (lance_3b). Image gen/edit and "
-            "image understanding are available. generate_video / edit_video "
+            "- Lance model: IMAGE-ONLY (lance_3b). generate_image, edit_image, "
+            "and image understanding are available. generate_video / edit_video "
             "are NOT available on this server — do not call them."
         )
-    else:
+    elif requested == "video":
         lines.append(
-            "- Lance model variant: VIDEO (lance_3b_video). All tasks are "
+            "- Lance model: VIDEO-ONLY (lance_3b_video). All tasks are "
             "available, though image text rendering is weaker than on the "
             "image variant."
+        )
+    else:
+        swap_note = ("the server hot-swaps between them as needed (~2-3s overhead per swap)"
+                     if lowvram else "both stay GPU-resident, no swap cost")
+        lines.append(
+            f"- Lance model: AUTO (both lance_3b and lance_3b_video available — "
+            f"{swap_note}). Currently active: {active.upper()}. Image gen/edit "
+            f"use the image variant (crisp in-image text); video gen/edit use "
+            f"the video variant — all tasks are available."
         )
     active = [j for j in conv.jobs.values() if j.status in ("queued", "running")]
     done = [j for j in conv.jobs.values() if j.status == "done"]
