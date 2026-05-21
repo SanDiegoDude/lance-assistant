@@ -1292,6 +1292,64 @@ def detect_attachment_kind(filename: str, content_type: Optional[str]) -> Option
     return None
 
 
+def probe_video(path: Path) -> Dict[str, Any]:
+    """Read frame count, fps, and resolution of a video file.
+
+    We use this to validate a video before submitting it to the Lance
+    edit pipeline — a too-short clip or one with exotic codec params
+    produces deep-in-the-pipeline torch errors that are useless to
+    debug from the agent's side. Better to fail fast with a clear
+    message.
+
+    Returns a dict ``{"frame_count": int, "fps": float, "width": int,
+    "height": int, "duration_seconds": float}`` on success, or raises
+    ``RuntimeError`` if the file can't be opened.
+    """
+    import imageio.v3 as iio
+    try:
+        meta = iio.immeta(str(path), plugin="pyav")
+    except Exception as e:
+        raise RuntimeError(f"could not read video metadata from {path.name}: {e}")
+    fps = float(meta.get("fps") or meta.get("frame_rate") or 0.0)
+    size = meta.get("size") or (0, 0)
+    width = int(size[0]) if isinstance(size, (tuple, list)) and len(size) >= 1 else 0
+    height = int(size[1]) if isinstance(size, (tuple, list)) and len(size) >= 2 else 0
+    duration = float(meta.get("duration") or 0.0)
+    frame_count = 0
+    if duration > 0 and fps > 0:
+        frame_count = int(round(duration * fps))
+    else:
+        # Fall back to walking the file (slow but always correct).
+        try:
+            for _ in iio.imiter(str(path), plugin="pyav"):
+                frame_count += 1
+        except Exception:
+            pass
+    return {
+        "frame_count": frame_count,
+        "fps": fps,
+        "width": width,
+        "height": height,
+        "duration_seconds": duration,
+    }
+
+
+def _video_edit_num_frames(probe: Dict[str, Any], requested: int = 81) -> int:
+    """Pick a valid ``num_frames`` for a video_edit job given the source.
+
+    Lance's video VAE expects ``num_frames`` of the form ``4k+1`` and the
+    fine-tune was trained on 121-frame clips at most. We also can't ask
+    for more frames than the source actually contains.
+    """
+    src = max(1, int(probe.get("frame_count") or 0))
+    target = min(int(requested), src, 121)
+    if target < 13:
+        return 13  # smallest valid k=3 (4*3+1)
+    # Round target down to the nearest 4k+1
+    k = (target - 1) // 4
+    return 4 * k + 1
+
+
 # ---------------------------------------------------------------------------
 # Conversation state + agentic message handling
 # ---------------------------------------------------------------------------
@@ -1627,12 +1685,29 @@ class AppState:
                                else conv.last_video_path)
             if not attachment_path:
                 raise ValueError("no video available to edit")
+            # Pre-flight check the source video — too-short clips or
+            # unreadable codecs lead to opaque torch errors deep in the
+            # Lance pipeline. Better to fail fast with a clear message.
+            try:
+                probe = probe_video(Path(attachment_path))
+            except RuntimeError as e:
+                raise ValueError(str(e))
+            if probe["frame_count"] < 13:
+                raise ValueError(
+                    f"video has only {probe['frame_count']} frame(s); "
+                    f"video_edit needs at least 13 (about 0.5 s at 24 fps). "
+                    f"Try a longer clip."
+                )
+            num_frames = _video_edit_num_frames(probe, requested=81)
+            log(f"edit_video: source {Path(attachment_path).name} "
+                f"frames={probe['frame_count']} fps={probe['fps']:.1f} "
+                f"size={probe['width']}x{probe['height']} -> num_frames={num_frames}")
             return JobRecord(
                 id=new_id("j"), conversation_id=conv.id, tool=tool, args=dict(args),
                 lance_task="video_edit",
                 lance_params={"steps": 50, "cfg_text_scale": 4.0, "seed": 42,
                               "height": 480, "width": 832, "resolution": "video_480p",
-                              "num_frames": 81, "timestep_shift": 3.5},
+                              "num_frames": num_frames, "timestep_shift": 3.5},
                 prompt=args.get("instruction", ""),
                 attachment_path=attachment_path, attachment_kind="video",
                 tool_call_id=tool_call_id,

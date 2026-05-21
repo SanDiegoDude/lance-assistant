@@ -117,6 +117,7 @@ class JobRecord:
     total_steps: int = 0
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    error_trace: Optional[str] = None  # full Python traceback, set on failure
     created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
@@ -159,6 +160,7 @@ class JobRecord:
             "total_steps": self.total_steps,
             "result": self.result,
             "error": self.error,
+            "error_trace": self.error_trace,
             "asset_id": self.asset_id,
             "created_at": self.created_at,
             "started_at": self.started_at,
@@ -509,11 +511,20 @@ class JobRunner:
                 _log(f"backfill error for job {job.id}: {e}")
             conv.events.emit("job_completed", payload)
         except Exception as e:  # noqa: BLE001
-            err = f"{type(e).__name__}: {e}"
             tb = traceback.format_exc()
-            _log(f"job {job.id} failed: {err}\n{tb}")
+            # Build a short error string that includes the actual call
+            # site, not just the exception class+message. The agent and
+            # the user are otherwise stuck guessing at where in the
+            # pipeline a `'NoneType' object has no attribute 'cpu'` came
+            # from — embedding the last 2-3 frames of the traceback is
+            # the difference between "good luck" and an actionable bug.
+            err_short = f"{type(e).__name__}: {e}"
+            tail = _last_frames(tb, n=3)
+            err = f"{err_short}\n  at {tail}" if tail else err_short
+            _log(f"job {job.id} failed: {err_short}\n{tb}")
             job.status = "failed"
             job.error = err
+            job.error_trace = tb
             job.finished_at = time.time()
             try:
                 self._backfill(job, {"kind": "error", "error": err}, None)
@@ -537,3 +548,22 @@ class JobRunner:
 def new_id(prefix: str = "") -> str:
     raw = uuid.uuid4().hex
     return f"{prefix}{raw[:16]}" if prefix else raw
+
+
+def _last_frames(tb: str, n: int = 3) -> str:
+    """Distill the most recent `n` frames of a Python traceback into a
+    compact ``file.py:LINE in func -> file.py:LINE in func`` chain.
+
+    The full traceback still ends up in JobRecord.error_trace (and the
+    server log); this is just the bit we glue onto the user/agent-facing
+    one-liner so a generic torch error ("'NoneType' has no attribute
+    'cpu'") at least tells you WHICH `.cpu()` call blew up.
+    """
+    import re
+    frames = []
+    for m in re.finditer(r'File "([^"]+)", line (\d+), in (\S+)', tb or ""):
+        path = m.group(1).rsplit("/", 1)[-1]
+        frames.append(f"{path}:{m.group(2)} in {m.group(3)}")
+    if not frames:
+        return ""
+    return " -> ".join(frames[-n:])
