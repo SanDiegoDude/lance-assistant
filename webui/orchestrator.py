@@ -598,8 +598,94 @@ class OrchestratorClient:
                  f"text_chars={total_text_chars} chunks={chunks_received} "
                  f"finish_reason={finish_reason!r}")
             yield {"type": "tool_call_done", "calls": final_calls}
+        elif finish_reason in ("tool_calls", "function_call"):
+            # Server told us "I'm done because of tool calls" but never sent
+            # the actual delta chunks. Observed in the wild with
+            # LM Studio + Qwen3-thinking on the very first turn of a fresh
+            # chat (probably the streaming layer eats deltas emitted during
+            # the model's thinking phase). The full response is still
+            # available via a normal non-streaming request, so refetch.
+            _dbg(f"stream_chat finish_reason={finish_reason!r} but no tool_call "
+                 f"deltas were streamed — falling back to non-streaming refetch")
+            try:
+                fallback_calls = await self._refetch_tool_calls(
+                    payload, messages, tools, model,
+                )
+            except Exception as e:  # noqa: BLE001
+                _dbg(f"stream_chat non-streaming fallback failed: "
+                     f"{type(e).__name__}: {e}")
+                fallback_calls = []
+            if fallback_calls:
+                _dbg(f"stream_chat fallback recovered {len(fallback_calls)} "
+                     f"tool_call(s): {[c['name'] for c in fallback_calls]}")
+                # Replay the partial events the UI expected so progress
+                # indicators show "tool call incoming" even on the fallback
+                # path.
+                for idx, call in enumerate(fallback_calls):
+                    yield {
+                        "type": "tool_call_partial",
+                        "index": idx,
+                        "id": call["id"],
+                        "name": call["name"],
+                        "arguments_delta": json.dumps(call["arguments"]),
+                    }
+                yield {"type": "tool_call_done", "calls": fallback_calls}
+            else:
+                _dbg("stream_chat fallback returned 0 tool_calls — giving up")
         else:
             _dbg(f"stream_chat done; tool_calls=0 text_chars={total_text_chars} "
                  f"chunks={chunks_received} finish_reason={finish_reason!r}")
 
         yield {"type": "stop", "finish_reason": finish_reason or "stop"}
+
+    async def _refetch_tool_calls(
+        self,
+        original_payload: Dict[str, Any],
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        model: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Refetch the same request with `stream=False` and pull tool
+        calls out of the resulting message. Used as a workaround when
+        a streaming response declared `finish_reason='tool_calls'`
+        but never sent the actual delta chunks. Returns a list of
+        `{id, name, arguments}` dicts (possibly empty if the server
+        still didn't return any tool calls).
+        """
+        url = self.settings.base_url.rstrip("/") + "/chat/completions"
+        payload = dict(original_payload)
+        payload["stream"] = False
+        # Pass everything through identically — same model, same tools,
+        # same temperature — so the server has every reason to make the
+        # same decision it just made.
+        timeout = httpx.Timeout(self.settings.request_timeout, connect=15.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(url, headers=self._headers, json=payload)
+        if r.status_code != 200:
+            _dbg(f"_refetch_tool_calls HTTP {r.status_code} body={r.text[:400]!r}")
+            return []
+        body = r.json()
+        choices = body.get("choices") or []
+        if not choices:
+            return []
+        msg = (choices[0] or {}).get("message") or {}
+        tcs = msg.get("tool_calls") or []
+        out: List[Dict[str, Any]] = []
+        for idx, tc in enumerate(tcs):
+            func = tc.get("function") or {}
+            raw_args = func.get("arguments") or "{}"
+            if isinstance(raw_args, str):
+                try:
+                    args = json.loads(raw_args)
+                except Exception:
+                    args = {"_raw": raw_args}
+            elif isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                args = {"_raw": str(raw_args)}
+            out.append({
+                "id": tc.get("id") or f"call_{idx}",
+                "name": func.get("name") or "",
+                "arguments": args,
+            })
+        return out
