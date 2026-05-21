@@ -2394,7 +2394,12 @@ async def run_agentic_turn(conv: Conversation) -> None:
         debug(f"run_agentic_turn conv={conv.id} turn={turn_id} "
               f"msgs={len(base_messages)} roles={roles} "
               f"situation={sit_lines!r} first_user={fu_preview!r}")
-        debug(f"run_agentic_turn allowed_variants={_allowed_variants()} "
+        try:
+            allowed = state.pipeline._allowed_variants() if state.pipeline else "<no pipeline>"
+        except Exception as _e:
+            allowed = f"<error: {_e}>"
+        debug(f"run_agentic_turn pipeline_loaded={state.pipeline.initialized if state.pipeline else False} "
+              f"allowed_variants={allowed} "
               f"tools={[t['function']['name'] for t in LANCE_TOOLS]}")
 
     try:
